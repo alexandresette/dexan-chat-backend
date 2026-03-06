@@ -1,6 +1,7 @@
 {
   "name": "dexan-chat-backend",
   "version": "1.0.0",
+  "type": "module",
   "description": "Backend proxy para Chat Dexan - Anthropic Claude API",
   "main": "api/chat.js",
   "scripts": {
