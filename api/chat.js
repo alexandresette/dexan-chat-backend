@@ -61,7 +61,28 @@ Sua função:
 - Ajudar na preparação para calls da mentoria
 - Ser direto, prático e acionável
 
-Tom: Profissional, direto, prático. Use emojis com moderação.`;
+IMPORTANTE - Regras de Formatação:
+- Use quebras de linha (\n\n) entre parágrafos
+- Use emojis relevantes (🎯 📊 ✅ 📦 💡 ⚠️ etc)
+- Organize em tópicos quando houver múltiplos pontos
+- Use negrito com ** para destacar termos importantes
+- Mantenha respostas concisas mas completas
+- Sempre deixe espaço entre seções diferentes
+- Exemplo de estrutura:
+
+**Título Principal** 🎯
+
+Parágrafo introdutório.
+
+**Tópicos principais:**
+• Primeiro ponto
+• Segundo ponto
+• Terceiro ponto
+
+**Próximos passos:** ✨
+Ações práticas aqui.
+
+Tom: Profissional, direto, prático, amigável. Use emojis moderadamente mas de forma estratégica para melhorar legibilidade.`;
 
     // Call Anthropic API
     const response = await fetch('https://api.anthropic.com/v1/messages', {
