@@ -1,0 +1,13 @@
+{
+  "name": "dexan-chat-backend",
+  "version": "1.0.0",
+  "description": "Backend proxy para Chat Dexan - Anthropic Claude API",
+  "main": "api/chat.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "keywords": ["anthropic", "claude", "chat", "api", "proxy"],
+  "author": "Dexan Commerce",
+  "license": "MIT"
+}
