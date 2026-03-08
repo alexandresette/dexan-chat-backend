@@ -89,6 +89,7 @@ async function fetchMarketData(product) {
     const reviews = reviewsData[idx];
     const seller = sellerMap[item.seller_id];
     const totalReviews = reviews?.paging?.total || null;
+    const ratingLider = reviews?.rating_average || null;
     const sellerRep = seller?.seller_reputation;
     const sellerLevel = sellerRep?.level_id || null; // '5_green' = platinum
     const sellerTotalVendas = sellerRep?.transactions?.total || null;
@@ -99,7 +100,9 @@ async function fetchMarketData(product) {
       price:        item.price,
       originalPrice: item.original_price,
       soldQuantity: null, // não disponível via app token
-      totalReviews,       // proxy: número de avaliações do produto
+      totalReviews,
+      ratingLider,
+      totalReviews_proxy: true, // proxy: número de avaliações do produto
       sellerTotalVendas,  // vendas históricas do vendedor
       sellerLevel,        // nível do seller (5_green = platinum)
       sellerNickname: seller?.nickname || null,
@@ -112,10 +115,17 @@ async function fetchMarketData(product) {
 
   // 9. Buscar títulos dos produtos de catálogo diretamente
   const prodDetails = await Promise.all(
-    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}?fields=id,name`))
+    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}?fields=id,name,attributes`))
   );
   prodDetails.forEach((p, i) => {
-    if (p?.name && items[i]) items[i].title = p.name;
+    if (!items[i]) return;
+    if (p?.name) items[i].title = p.name;
+    const pesoAttr = p?.attributes?.find(a => a.id === 'WEIGHT' || (a.name && a.name.toLowerCase().includes('peso')));
+    if (pesoAttr?.value_name) {
+      items[i].pesoStr = pesoAttr.value_name;
+      const m = pesoAttr.value_name.match(/([\d.,]+)\s*(kg|g)/i);
+      if (m) items[i].pesoKg = m[2].toLowerCase()==='kg' ? parseFloat(m[1].replace(',','.')) : parseFloat(m[1].replace(',','.'))/1000;
+    }
   });
 
   // 10. Calcular métricas
@@ -124,6 +134,9 @@ async function fetchMarketData(product) {
   const freteCount = items.filter(i => i.freeShipping).length;
   const freeShippingPct = items.length ? Math.round((freteCount/items.length)*100) : 0;
   const maxReviews = items.some(i => i.totalReviews) ? Math.max(...items.filter(i=>i.totalReviews).map(i=>i.totalReviews)) : null;
+  const lider = [...items].sort((a,b)=>(b.totalReviews||0)-(a.totalReviews||0))[0] || null;
+  const avaliacaoLider = lider?.ratingLider || null;
+  const pesoLider = lider?.pesoKg || null;
 
   // Ordenar por reviews (proxy de vendas)
   const topSellers = [...items]
