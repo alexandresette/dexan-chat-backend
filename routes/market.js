@@ -1,136 +1,196 @@
-// routes/market.js — DEXAN Backend v2.0 Railway
-// ML API via ProxyAgent undici (sem restrições no Railway!)
+// routes/market.js — DEXAN Backend v3.0
+// Usa API ML oficial (endpoints que funcionam sem aprovação especial)
+// Estratégia: domain_discovery + highlights + items em lote
 
-import { ProxyAgent } from 'undici';
+const ML_CLIENT_ID = process.env.ML_CLIENT_ID || '3701874079446192';
+const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'e5ZtVNh1Ltag4kGCKlwRFQuoG7zv0C3a';
 
-async function fetchMLViaNativeProxy(product) {
-  const user = process.env.IPROYAL_USER;
-  const pass = process.env.IPROYAL_PASS;
-  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
-  const port = process.env.IPROYAL_PORT || '12321';
+let cachedToken = null;
+let tokenExpiry = 0;
 
-  if (!user || !pass) throw new Error('Credenciais proxy não configuradas');
-
-  const client = new ProxyAgent({
-    uri: `http://${user}:${pass}@${host}:${port}`,
-    connectTimeout: 20000,
-    headersTimeout: 20000
+async function getMLToken() {
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=client_credentials&client_id=${ML_CLIENT_ID}&client_secret=${ML_CLIENT_SECRET}`
   });
-
-  const q = encodeURIComponent(product);
-  const response = await fetch(
-    `https://api.mercadolibre.com/sites/MLB/search?q=${q}&limit=20&sort=relevance`,
-    {
-      dispatcher: client,
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-      }
-    }
-  );
-
-  if (!response.ok) throw new Error(`ML HTTP ${response.status}`);
-  return response.json();
-}
-
-async function fetchMLViaSerpApi(product) {
-  const serpKey = process.env.SERPAPI_KEY;
-  if (!serpKey) return { error: 'Sem SERPAPI_KEY', totalItems: 0, topSellers: [] };
-
-  const q = encodeURIComponent(product);
-  const url = `https://serpapi.com/search.json?engine=google_shopping&q=${q}&gl=br&hl=pt-BR&location=Brazil&api_key=${serpKey}&num=40`;
-
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('SerpApi error: ' + resp.status);
+  if (!resp.ok) throw new Error('Falha token ML: ' + resp.status);
   const data = await resp.json();
-  if (data.error) throw new Error(data.error);
-
-  const all = data.shopping_results || [];
-  if (!all.length) return { error: 'Sem resultados', totalItems: 0, topSellers: [] };
-
-  const mlItems = all.filter(i => String(i.source || '').toLowerCase().includes('mercado'));
-  const primary = mlItems.length >= 3 ? mlItems : all;
-
-  const ep = p => {
-    if (!p) return null;
-    const n = parseFloat(String(p).replace(/[^\d,\.]/g, '').replace(',', '.'));
-    return n > 0 && n < 50000 ? n : null;
-  };
-
-  const prices = primary.map(i => ep(i.price)).filter(Boolean);
-  if (!prices.length) return { error: 'Sem preços válidos', totalItems: 0, topSellers: [] };
-
-  const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-  return {
-    source: 'serpapi_shopping',
-    query: product,
-    totalItems: mlItems.length >= 3 ? mlItems.length : all.length,
-    prices: { avg: +avg.toFixed(2), min: +Math.min(...prices).toFixed(2), max: +Math.max(...prices).toFixed(2) },
-    freeShippingPct: 0,
-    topSellers: primary.slice(0, 6).map(i => ({
-      title: i.title || 'Produto',
-      price: ep(i.price),
-      soldQuantity: null,
-      rating: i.rating ? parseFloat(i.rating) : null,
-      freeShipping: false,
-      isML: String(i.source || '').toLowerCase().includes('mercado'),
-      source: i.source
-    }))
-  };
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
+  return cachedToken;
 }
 
-function formatMLNative(product, items, total) {
-  const prices = items.map(i => parseFloat(i.price)).filter(p => p > 0);
-  const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
-  const freeCount = items.filter(i => i.shipping?.free_shipping).length;
-  return {
-    source: 'ml_native_proxy',
-    query: product,
-    totalItems: total || items.length,
-    prices: {
-      avg: +avg.toFixed(2),
-      min: +Math.min(...prices).toFixed(2),
-      max: +Math.max(...prices).toFixed(2)
-    },
-    freeShippingPct: Math.round((freeCount / items.length) * 100),
-    topSellers: items.slice(0, 6).map(i => ({
-      title: i.title,
-      price: parseFloat(i.price),
-      soldQuantity: i.sold_quantity || 0,
-      rating: i.reviews?.rating_average ? +i.reviews.rating_average.toFixed(1) : null,
-      freeShipping: i.shipping?.free_shipping || false,
-      fulfillment: i.shipping?.logistic_type === 'fulfillment',
-      condition: i.condition,
-      link: i.permalink
-    }))
-  };
+async function mlFetch(url) {
+  const token = await getMLToken();
+  const resp = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+  });
+  if (!resp.ok) throw new Error(`ML API ${resp.status}: ${url.split('?')[0].split('/').slice(-2).join('/')}`);
+  return resp.json();
 }
 
-export async function handleMarket(req, res) {
-  const { product, source } = req.body || {};
-  if (!product) return res.status(400).json({ error: 'product required' });
-  if (source && source !== 'mercadolivre')
-    return res.status(400).json({ error: 'source inválida. Use: mercadolivre' });
+async function fetchMarketData(product) {
+  // 1. Descobrir categoria exata
+  const discovery = await mlFetch(
+    `https://api.mercadolibre.com/sites/MLB/domain_discovery/search?q=${encodeURIComponent(product)}&limit=1`
+  );
+  const categoryId   = discovery[0]?.category_id   || null;
+  const domainId     = discovery[0]?.domain_id     || null;
+  const categoryName = discovery[0]?.category_name || product;
 
-  // Tentar proxy ML nativo primeiro
-  try {
-    console.log(`[market] tentando ML nativo via proxy para: ${product}`);
-    const data = await fetchMLViaNativeProxy(product);
-    const items = data.results || [];
-    if (items.length > 0) {
-      console.log(`[market] ✅ ML nativo via proxy: ${items.length} itens`);
-      return res.json(formatMLNative(product, items, data.paging?.total));
-    }
-    console.log('[market] ML proxy retornou 0 itens, fallback SerpApi');
-  } catch (e) {
-    console.log(`[market] proxy falhou: ${e.message} — fallback SerpApi`);
+  // 2. Total de anúncios na categoria
+  let totalAnuncios = null;
+  if (categoryId) {
+    try {
+      const catData = await mlFetch(`https://api.mercadolibre.com/categories/${categoryId}`);
+      totalAnuncios = catData.total_items_in_this_category;
+    } catch(e) {}
   }
 
-  // Fallback SerpApi
+  // 3. Top sellers via highlights
+  let topItemIds = [];
+  if (categoryId) {
+    try {
+      const hl = await mlFetch(`https://api.mercadolibre.com/highlights/MLB/category/${categoryId}`);
+      topItemIds = (hl.content || [])
+        .filter(c => c.id && c.id.startsWith('MLB') && !c.id.startsWith('MLBU') && c.id.length <= 13)
+        .map(c => c.id)
+        .slice(0, 20);
+    } catch(e) {}
+  }
+
+  // 4. Detalhes dos items em lote
+  let items = [];
+  if (topItemIds.length > 0) {
+    try {
+      const batchUrl = `https://api.mercadolibre.com/items?ids=${topItemIds.join(',')}&attributes=id,title,price,sold_quantity,shipping,seller_id,condition,reviews_rating_summary`;
+      const batchData = await mlFetch(batchUrl);
+      items = batchData
+        .filter(i => i.code === 200)
+        .map(i => ({
+          id:           i.body.id,
+          title:        i.body.title,
+          price:        i.body.price,
+          soldQuantity: i.body.sold_quantity,
+          freeShipping: i.body.shipping?.free_shipping || false,
+          fulfillment:  i.body.shipping?.logistic_type === 'fulfillment',
+          rating:       i.body.reviews_rating_summary?.rating_average || null,
+          reviewsTotal: i.body.reviews_rating_summary?.total || null,
+          condition:    i.body.condition,
+          link:         `https://www.mercadolivre.com.br/p/${i.body.id}`
+        }));
+    } catch(e) {}
+  }
+
+  // 5. Fallback: products/search para nomes se items vazio
+  if (items.length === 0) {
+    try {
+      const prodSearch = await mlFetch(
+        `https://api.mercadolibre.com/products/search?site_id=MLB&status=active&q=${encodeURIComponent(product)}&limit=10`
+      );
+      items = (prodSearch.results || []).slice(0, 10).map(p => ({
+        id:           p.id,
+        title:        p.name,
+        price:        null,
+        soldQuantity: null,
+        freeShipping: null,
+        fulfillment:  null,
+        rating:       null,
+        condition:    'new'
+      }));
+    } catch(e) {}
+  }
+
+  // 6. Calcular métricas
+  const precos = items.map(i => i.price).filter(p => p !== null && p > 0 && p < 100000);
+  const avgPreco = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
+  const freteCount = items.filter(i => i.freeShipping).length;
+  const freeShippingPct = items.length ? Math.round((freteCount/items.length)*100) : 0;
+  const maxVendidos = items.some(i => i.soldQuantity !== null)
+    ? Math.max(...items.filter(i => i.soldQuantity !== null).map(i => i.soldQuantity))
+    : null;
+  const comRating = items.filter(i => i.rating !== null);
+  const avgRating = comRating.length
+    ? +(comRating.reduce((a,b)=>a+b.rating,0)/comRating.length).toFixed(1)
+    : null;
+
+  const topSellers = [...items]
+    .sort((a,b) => (b.soldQuantity||0) - (a.soldQuantity||0))
+    .slice(0, 6);
+
+  return {
+    source: 'ml_api',
+    query: product,
+    categoryId,
+    categoryName,
+    domainId,
+    totalItems: totalAnuncios,
+    totalScraped: items.length,
+    prices: avgPreco !== null ? {
+      avg: +avgPreco.toFixed(2),
+      min: +Math.min(...precos).toFixed(2),
+      max: +Math.max(...precos).toFixed(2)
+    } : null,
+    freeShippingPct,
+    maxVendidosMes: maxVendidos,
+    avgRating,
+    topSellers
+  };
+}
+
+async function fetchSerpApi(product) {
+  const key = process.env.SERPAPI_KEY;
+  if (!key) throw new Error('SERPAPI_KEY não configurada');
+  const q = encodeURIComponent(product + ' site:mercadolivre.com.br');
+  const url = `https://serpapi.com/search.json?engine=google_shopping&q=${q}&gl=br&hl=pt&num=20&api_key=${key}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('SerpApi error ' + resp.status);
+  const data = await resp.json();
+  const results = data.shopping_results || [];
+  if (!results.length) return null;
+  const precos = results.map(r => parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.'))).filter(p=>!isNaN(p)&&p>0);
+  const avg = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
+  return {
+    source: 'serpapi_fallback',
+    query: product,
+    totalItems: null,
+    prices: avg ? { avg: +avg.toFixed(2), min: Math.min(...precos), max: Math.max(...precos) } : null,
+    freeShippingPct: 0,
+    maxVendidosMes: null,
+    avgRating: null,
+    topSellers: results.slice(0,5).map(r => ({
+      title: r.title,
+      price: parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')) || null,
+      soldQuantity: null,
+      freeShipping: false,
+      rating: r.rating || null
+    }))
+  };
+}
+
+export default async function marketHandler(req, res) {
+  const { product } = req.body || {};
+  if (!product) return res.status(400).json({ error: 'product obrigatório' });
+
   try {
-    const result = await fetchMLViaSerpApi(product);
-    return res.json(result);
+    const data = await fetchMarketData(product);
+    if (!data.prices && !data.topSellers.length) {
+      try {
+        const serpData = await fetchSerpApi(product);
+        if (serpData) return res.json(serpData);
+      } catch(e2) {}
+    }
+    return res.json(data);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('Market error:', err.message);
+    try {
+      const serpData = await fetchSerpApi(product);
+      if (serpData) return res.json(serpData);
+    } catch(e2) {
+      console.error('SerpApi fallback error:', e2.message);
+    }
+    return res.status(500).json({ error: 'Falha ao buscar dados: ' + err.message });
   }
 }
