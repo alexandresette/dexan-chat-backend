@@ -8,6 +8,9 @@
     "dev": "vercel dev",
     "deploy": "vercel --prod"
   },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.2"
+  },
   "keywords": ["anthropic", "claude", "chat", "api", "proxy"],
   "author": "Dexan Commerce",
   "license": "MIT"
