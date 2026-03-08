@@ -67,9 +67,10 @@ async function fetchMarketData(product) {
     .filter(d => d?.results?.length > 0)
     .map(d => d.results[0]);
 
-  // 6. Buscar reviews de cada produto em paralelo (reviews = proxy de popularidade)
+  // 6. Buscar reviews de cada item vencedor em paralelo (reviews = proxy de popularidade)
+  const itemIds = itemDataList.map(i => i.item_id).filter(Boolean);
   const reviewsData = await Promise.all(
-    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/reviews/item/${pid}`))
+    itemIds.map(iid => mlFetchSafe(`https://api.mercadolibre.com/reviews/item/${iid}`))
   );
 
   // 7. Buscar seller_reputation em paralelo para os top sellers
