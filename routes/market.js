@@ -170,7 +170,7 @@ async function fetchSerpApi(product) {
   };
 }
 
-export default async function marketHandler(req, res) {
+export async function handleMarket(req, res) {
   const { product } = req.body || {};
   if (!product) return res.status(400).json({ error: 'product obrigatório' });
 
