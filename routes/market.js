@@ -110,13 +110,13 @@ async function fetchMarketData(product) {
     };
   });
 
-  // 9. Buscar títulos via products search (complementar)
-  const prodSearch = await mlFetchSafe(
-    `https://api.mercadolibre.com/products/search?site_id=MLB&status=active&q=${encodeURIComponent(product)}&limit=10`
+  // 9. Buscar títulos dos produtos de catálogo diretamente
+  const prodDetails = await Promise.all(
+    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}?fields=id,name`))
   );
-  const prodNameMap = {};
-  (prodSearch?.results || []).forEach(p => { prodNameMap[p.id] = p.name; });
-  productIds.forEach((pid, i) => { if (items[i]) items[i].title = prodNameMap[pid] || null; });
+  prodDetails.forEach((p, i) => {
+    if (p?.name && items[i]) items[i].title = p.name;
+  });
 
   // 10. Calcular métricas
   const precos = items.map(i => i.price).filter(p => p != null && p > 0 && p < 100000);
