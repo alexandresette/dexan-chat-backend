@@ -6,9 +6,8 @@
   "main": "api/chat.js",
   "scripts": { "dev": "vercel dev", "deploy": "vercel --prod" },
   "dependencies": {
+    "undici": "^6.6.2",
     "axios": "^1.6.0"
   },
-  "keywords": [],
-  "author": "Dexan Commerce",
   "license": "MIT"
 }
