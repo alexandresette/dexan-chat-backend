@@ -1,5 +1,9 @@
-// routes/market.js — DEXAN Backend v6.0
-// API ML real: domain_discovery + highlights + products/items + reviews + seller + peso/dim + visitas
+// routes/market.js — DEXAN Backend v7.0
+// Scraping REAL das 20 páginas ML com keyword exata
+// Dados: total anúncios, lojas oficiais, full, frete grátis, ML líderes,
+//        venda internacional, promoções, mercado endereçável, preço médio p1 e p20
+
+import { ProxyAgent } from 'undici';
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '3701874079446192';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'e5ZtVNh1Ltag4kGCKlwRFQuoG7zv0C3a';
@@ -21,261 +25,245 @@ async function getMLToken() {
   return cachedToken;
 }
 
-async function mlFetch(url) {
-  const token = await getMLToken();
-  const resp = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
-  });
-  if (!resp.ok) throw new Error(`ML ${resp.status}: ${url.split('?')[0].split('/').slice(-2).join('/')}`);
+function getProxyAgent() {
+  const user = process.env.IPROYAL_USER;
+  const pass = process.env.IPROYAL_PASS;
+  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
+  const port = process.env.IPROYAL_PORT || '12321';
+  if (!user || !pass) return null;
+  try {
+    return new ProxyAgent({
+      uri: `http://${user}:${pass}@${host}:${port}`,
+      connectTimeout: 20000
+    });
+  } catch(e) {
+    console.warn('Proxy agent error:', e.message);
+    return null;
+  }
+}
+
+async function fetchMLSearchPage(query, offset, token, proxy) {
+  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=50&offset=${offset}`;
+  const headers = {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (compatible; DEXAN/1.0)'
+  };
+
+  if (proxy) {
+    try {
+      const resp = await fetch(url, { dispatcher: proxy, headers });
+      if (resp.ok) return resp.json();
+      console.warn(`Proxy falhou offset=${offset}: ${resp.status}`);
+    } catch(e) {
+      console.warn(`Proxy erro offset=${offset}: ${e.message}`);
+    }
+  }
+
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) throw new Error(`ML search ${resp.status} offset=${offset}`);
   return resp.json();
 }
 
-async function mlFetchSafe(url) {
-  try { return await mlFetch(url); } catch(e) { return null; }
-}
-
-// Extrair peso/dimensão dos atributos do produto
-function extractPesoFromAttributes(attrs = []) {
-  const pesoAttr = attrs.find(a => a.name?.toLowerCase().includes('peso') || a.id === 'WEIGHT');
-  const altAttr  = attrs.find(a => a.name?.toLowerCase().includes('altura') || a.id === 'HEIGHT');
-  const largAttr = attrs.find(a => a.name?.toLowerCase().includes('largura') || a.id === 'WIDTH');
-  const compAttr = attrs.find(a => a.name?.toLowerCase().includes('comprimento') || a.id === 'LENGTH');
-
-  const parseVal = (attr) => {
-    if (!attr) return null;
-    const match = attr.value_name?.match(/([\d.,]+)/);
-    return match ? parseFloat(match[1].replace(',', '.')) : null;
+function analyzeResults(results) {
+  const metrics = {
+    count: 0,
+    oficiais: 0,
+    full: 0,
+    freteGratis: 0,
+    mercadoLideres: 0,
+    internacional: 0,
+    promocao: 0,
+    somaPrecos: 0,
+    precos: [],
+    sellers: new Set()
   };
 
-  const pesoKg  = parseVal(pesoAttr);
-  const altCm   = parseVal(altAttr);
-  const largCm  = parseVal(largAttr);
-  const compCm  = parseVal(compAttr);
+  for (const item of results) {
+    metrics.count++;
+    const preco = item.price || 0;
+    if (preco > 0 && preco < 500000) {
+      metrics.somaPrecos += preco;
+      metrics.precos.push(preco);
+    }
 
-  // Classificação operacional DEXAN
-  let categoriaOperacional = 'desconhecido';
-  if (pesoKg !== null) {
-    if (pesoKg <= 0.5)      categoriaOperacional = 'mini';     // ideal - PAC até R$15
-    else if (pesoKg <= 1.5) categoriaOperacional = 'leve';     // bom  - PAC até R$25
-    else if (pesoKg <= 5)   categoriaOperacional = 'medio';    // ok   - R$30-60
-    else                    categoriaOperacional = 'pesado';   // ruim - R$60+
+    if (item.official_store_id || item.official_store_name) metrics.oficiais++;
+
+    const logistic = item.shipping?.logistic_type || '';
+    if (logistic === 'fulfillment') metrics.full++;
+
+    if (item.shipping?.free_shipping) metrics.freteGratis++;
+
+    const level = item.seller?.seller_reputation?.level_id || '';
+    if (level.includes('gold') || level.includes('platinum')) metrics.mercadoLideres++;
+
+    if (item.international_delivery_mode && item.international_delivery_mode !== 'none') {
+      metrics.internacional++;
+    }
+
+    if (item.original_price && item.original_price > item.price) metrics.promocao++;
+
+    if (item.seller?.id) metrics.sellers.add(item.seller.id);
   }
 
-  return { pesoKg, altCm, largCm, compCm, categoriaOperacional };
-}
-
-// Estimativa de vendas/mês via visitas (conversão ~2-5%)
-function estimarVendasMes(visitasMes, totalReviews) {
-  if (!visitasMes && !totalReviews) return null;
-  if (visitasMes) {
-    // Taxa de conversão típica ML: 2-4%
-    const estimativaMin = Math.round(visitasMes * 0.02);
-    const estimativaMax = Math.round(visitasMes * 0.04);
-    return { visitasMes, estimativaMin, estimativaMax, fonte: 'visitas_reais' };
-  }
-  // Proxy: reviews acumuladas / 12 meses (estimativa conservadora)
-  if (totalReviews) {
-    const estimativa = Math.round(totalReviews / 12);
-    return { estimativa, fonte: 'reviews_proxy' };
-  }
-  return null;
+  return metrics;
 }
 
 async function fetchMarketData(product) {
-  // 1. Descobrir categoria exata
-  const discovery = await mlFetch(
-    `https://api.mercadolibre.com/sites/MLB/domain_discovery/search?q=${encodeURIComponent(product)}&limit=1`
-  );
-  const categoryId   = discovery[0]?.category_id   || null;
-  const categoryName = discovery[0]?.category_name || product;
-  const domainId     = discovery[0]?.domain_id     || null;
+  const token = await getMLToken();
+  const proxy = getProxyAgent();
 
-  // 2. Total de anúncios + highlights em paralelo
-  const [catData, hlData] = await Promise.all([
-    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/categories/${categoryId}`) : null,
-    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/highlights/MLB/category/${categoryId}`) : null
-  ]);
-  const totalAnuncios = catData?.total_items_in_this_category || null;
+  console.log(`Buscando "${product}" via ML API...`);
 
-  // 3. Top produtos do catálogo (highlights)
-  const productIds = (hlData?.content || [])
-    .filter(c => c.type === 'PRODUCT' && c.id?.startsWith('MLB') && !c.id.startsWith('MLBU'))
-    .map(c => c.id)
-    .slice(0, 6);
+  let page1;
+  try {
+    page1 = await fetchMLSearchPage(product, 0, token, proxy);
+  } catch(e) {
+    throw new Error(`Falha na busca ML: ${e.message}`);
+  }
 
-  // 4. Buscar item vencedor de cada produto
-  const productItemsRaw = await Promise.all(
-    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}/items?limit=1`))
-  );
-  const itemDataList = productItemsRaw
-    .filter(d => d?.results?.length > 0)
-    .map(d => d.results[0]);
+  const totalBusca = page1.paging?.total || 0;
+  const resultadosPorPagina = page1.paging?.limit || 50;
+  const queryRetornada = page1.query || product;
+  const nomeCategoria = page1.filters?.find(f => f.id === 'category')?.values?.[0]?.name || null;
 
-  // 5. DADOS COMPLETOS DO LÍDER (primeiro da lista)
-  const liderItem = itemDataList[0] || null;
-  const liderProdId = productIds[0] || null;
+  console.log(`Total: ${totalBusca} | Categoria: ${nomeCategoria}`);
 
-  // 5a. Reviews + rating do líder
-  const liderReviews = liderItem ? await mlFetchSafe(
-    `https://api.mercadolibre.com/reviews/item/${liderItem.item_id}`
-  ) : null;
+  const page1Results = page1.results || [];
+  const metricasP1 = analyzeResults(page1Results);
 
-  // 5b. Visitas 30 dias do líder (estimativa de vendas/mês)
-  const liderVisitas = liderItem ? await mlFetchSafe(
-    `https://api.mercadolibre.com/items/${liderItem.item_id}/visits/time_window?last=30&unit=day`
-  ) : null;
+  const maxItems = Math.min(totalBusca, 1000);
+  const totalPaginas = Math.ceil(maxItems / resultadosPorPagina);
+  const paginasParaBuscar = Math.min(totalPaginas, 20);
 
-  // 5c. Atributos do produto (peso, dimensões) do produto catálogo líder
-  const liderProdDetails = liderProdId ? await mlFetchSafe(
-    `https://api.mercadolibre.com/products/${liderProdId}?fields=id,name,attributes`
-  ) : null;
+  const allResults = [...page1Results];
 
-  // 5d. Seller do líder
-  const liderSellerId = liderItem?.seller_id;
-  const liderSeller = liderSellerId ? await mlFetchSafe(
-    `https://api.mercadolibre.com/users/${liderSellerId}?attributes=id,nickname,seller_reputation`
-  ) : null;
+  for (let batchStart = 1; batchStart < paginasParaBuscar; batchStart += 5) {
+    const batchEnd = Math.min(batchStart + 5, paginasParaBuscar);
+    const batch = [];
 
-  // 6. Reviews dos demais sellers em paralelo
-  const itemIds = itemDataList.map(i => i.item_id).filter(Boolean);
-  const reviewsData = await Promise.all(
-    itemIds.map(iid => mlFetchSafe(`https://api.mercadolibre.com/reviews/item/${iid}`))
-  );
+    for (let p = batchStart; p < batchEnd; p++) {
+      const offset = p * resultadosPorPagina;
+      batch.push(
+        fetchMLSearchPage(product, offset, token, proxy)
+          .then(d => d.results || [])
+          .catch(e => { console.warn(`Pag ${p+1} falhou: ${e.message}`); return []; })
+      );
+    }
 
-  // 7. Seller reputation dos demais
-  const sellerIds = [...new Set(itemDataList.map(i => i.seller_id).filter(Boolean))];
-  const sellerData = await Promise.all(
-    sellerIds.map(sid => mlFetchSafe(`https://api.mercadolibre.com/users/${sid}?attributes=id,nickname,seller_reputation`))
-  );
-  const sellerMap = {};
-  sellerData.filter(Boolean).forEach(s => { if (s.id) sellerMap[s.id] = s; });
+    const batchResults = await Promise.all(batch);
+    batchResults.forEach(r => allResults.push(...r));
 
-  // 8. Títulos dos produtos de catálogo
-  const prodDetails = await Promise.all(
-    productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}?fields=id,name,attributes`))
-  );
+    if (batchEnd < paginasParaBuscar) await new Promise(r => setTimeout(r, 300));
+  }
 
-  // 9. Montar items
-  const items = itemDataList.map((item, idx) => {
-    const reviews = reviewsData[idx];
-    const seller  = sellerMap[item.seller_id] || (idx === 0 ? liderSeller : null);
-    const prod    = prodDetails[idx];
-    const pesoInfo = extractPesoFromAttributes(prod?.attributes || []);
+  console.log(`Items coletados: ${allResults.length}`);
 
-    return {
-      id:             item.item_id,
-      title:          prod?.name || null,
-      price:          item.price,
-      originalPrice:  item.original_price,
-      soldQuantity:   null,
-      totalReviews:   reviews?.paging?.total || null,
-      ratingAvg:      reviews?.rating_average || null,
-      sellerTotalVendas: seller?.seller_reputation?.transactions?.total || null,
-      sellerLevel:    seller?.seller_reputation?.level_id || null,
-      sellerNickname: seller?.nickname || null,
-      freeShipping:   item.shipping?.free_shipping || false,
-      fulfillment:    item.shipping?.logistic_type === 'fulfillment',
-      condition:      item.condition,
-      pesoKg:         pesoInfo.pesoKg,
-      categoriaOperacional: pesoInfo.categoriaOperacional,
-      link:           `https://www.mercadolivre.com.br/p/${productIds[idx] || item.item_id}`
-    };
-  });
+  const metricas20 = analyzeResults(allResults);
 
-  // 10. Dados do LÍDER (extra)
-  const liderPeso = extractPesoFromAttributes(liderProdDetails?.attributes || []);
-  const liderVendasEstimada = estimarVendasMes(
-    liderVisitas?.total_visits || null,
-    liderReviews?.paging?.total || null
-  );
-  const liderRating = liderReviews?.rating_average || null;
-  const liderTotalReviews = liderReviews?.paging?.total || null;
+  const precoMedioP1 = metricasP1.precos.length
+    ? metricasP1.precos.reduce((a,b)=>a+b,0) / metricasP1.precos.length : null;
 
-  // 11. Métricas gerais
-  const precos = items.map(i => i.price).filter(p => p != null && p > 0 && p < 100000);
-  const avgPreco = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
-  const freteCount = items.filter(i => i.freeShipping).length;
-  const freeShippingPct = items.length ? Math.round((freteCount/items.length)*100) : 0;
-  const maxReviews = Math.max(...items.map(i => i.totalReviews || 0).filter(v => v > 0), 0) || null;
+  const precos20 = metricas20.precos;
+  const precoMedio20 = precos20.length
+    ? precos20.reduce((a,b)=>a+b,0) / precos20.length : null;
 
-  const topSellers = [...items]
-    .sort((a,b) => (b.totalReviews||0) - (a.totalReviews||0))
-    .slice(0, 6);
+  const topMap = {};
+  for (const item of allResults) {
+    const sid = item.seller?.id;
+    if (!sid) continue;
+    if (!topMap[sid]) {
+      topMap[sid] = {
+        sellerNickname: item.seller?.nickname || null,
+        sellerLevel: item.seller?.seller_reputation?.level_id || null,
+        powerStatus: item.seller?.seller_reputation?.power_seller_status || null,
+        count: 0, somaPrecos: 0, topItem: null
+      };
+    }
+    topMap[sid].count++;
+    topMap[sid].somaPrecos += item.price || 0;
+    if (!topMap[sid].topItem) {
+      topMap[sid].topItem = {
+        id: item.id, title: item.title, price: item.price,
+        freeShipping: item.shipping?.free_shipping || false,
+        fulfillment: item.shipping?.logistic_type === 'fulfillment',
+        originalPrice: item.original_price || null,
+        link: item.permalink, thumbnail: item.thumbnail
+      };
+    }
+  }
+
+  const topSellers = Object.values(topMap)
+    .sort((a,b) => b.somaPrecos - a.somaPrecos)
+    .slice(0, 5)
+    .map(s => ({
+      sellerNickname: s.sellerNickname,
+      sellerLevel: s.sellerLevel,
+      powerStatus: s.powerStatus,
+      anunciosEncontrados: s.count,
+      faturamentoEstimado: +s.somaPrecos.toFixed(2),
+      topItem: s.topItem
+    }));
+
+  const melhoresAnuncios = page1Results.slice(0, 10).map(item => ({
+    id: item.id,
+    title: item.title,
+    price: item.price,
+    originalPrice: item.original_price || null,
+    freeShipping: item.shipping?.free_shipping || false,
+    fulfillment: item.shipping?.logistic_type === 'fulfillment',
+    sellerNickname: item.seller?.nickname || null,
+    sellerLevel: item.seller?.seller_reputation?.level_id || null,
+    condition: item.condition,
+    thumbnail: item.thumbnail,
+    link: item.permalink,
+    isOficial: !!(item.official_store_id || item.official_store_name),
+    isPromocao: !!(item.original_price && item.original_price > item.price),
+    isInternacional: !!(item.international_delivery_mode && item.international_delivery_mode !== 'none')
+  }));
 
   return {
-    source: 'ml_api_v6',
+    source: 'ml_scraping_v7',
     query: product,
-    categoryId,
-    categoryName,
-    domainId,
-    totalItems: totalAnuncios,
-    totalScraped: items.length,
-    prices: avgPreco !== null ? {
-      avg: +avgPreco.toFixed(2),
-      min: +Math.min(...precos).toFixed(2),
-      max: +Math.max(...precos).toFixed(2)
-    } : null,
-    freeShippingPct,
-    maxVendidosMes: null,
-    maxReviews,
+    queryRetornada,
+    nomeCategoria,
+    paginasAnalisadas: paginasParaBuscar,
+    itemsAnalisados: allResults.length,
 
-    // ── DADOS DO LÍDER (para preencher Metrify automaticamente) ──
-    lider: {
-      titulo:          items[0]?.title || null,
-      preco:           items[0]?.price || null,
-      ratingAvg:       liderRating,           // ⭐ avaliação real
-      totalReviews:    liderTotalReviews,
-      visitasMes:      liderVisitas?.total_visits || null,
-      vendasEstimada:  liderVendasEstimada,   // 📦 vendas/mês estimadas
-      pesoKg:          liderPeso.pesoKg,      // ⚖️ peso real do produto
-      categoriaOp:     liderPeso.categoriaOperacional, // mini/leve/medio/pesado
-      fulfillment:     items[0]?.fulfillment || false,
-      sellerNickname:  items[0]?.sellerNickname || null,
-      sellerLevel:     items[0]?.sellerLevel || null,
-      sellerVendas:    items[0]?.sellerTotalVendas || null,
-    },
+    totalAnuncios: totalBusca,
+    totalLojasOficiais: metricas20.oficiais,
+    totalFull: metricas20.full,
+    totalFreteGratis: metricas20.freteGratis,
+    totalMercadoLideres: metricas20.mercadoLideres,
+    totalInternacional: metricas20.internacional,
+    totalPromocao: metricas20.promocao,
+    totalSellers: metricas20.sellers.size,
 
-    topSellers
-  };
-}
+    mercadoEnderecavel: +metricas20.somaPrecos.toFixed(2),
+    precoMedioP1: precoMedioP1 ? +precoMedioP1.toFixed(2) : null,
+    precoMedio20: precoMedio20 ? +precoMedio20.toFixed(2) : null,
+    precoMin: precos20.length ? +Math.min(...precos20).toFixed(2) : null,
+    precoMax: precos20.length ? +Math.max(...precos20).toFixed(2) : null,
 
-async function fetchSerpApi(product) {
-  const key = process.env.SERPAPI_KEY;
-  if (!key) throw new Error('SERPAPI_KEY não configurada');
-  const q = encodeURIComponent(product + ' site:mercadolivre.com.br');
-  const url = `https://serpapi.com/search.json?engine=google_shopping&q=${q}&gl=br&hl=pt&num=20&api_key=${key}`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('SerpApi ' + resp.status);
-  const data = await resp.json();
-  const results = data.shopping_results || [];
-  if (!results.length) return null;
-  const precos = results.map(r=>parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.'))).filter(p=>!isNaN(p)&&p>0);
-  const avg = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
-  return {
-    source: 'serpapi_fallback', query: product, totalItems: null,
-    prices: avg ? { avg: +avg.toFixed(2), min: Math.min(...precos), max: Math.max(...precos) } : null,
-    freeShippingPct: 0, maxVendidosMes: null, maxReviews: null, lider: null,
-    topSellers: results.slice(0,5).map(r=>({
-      title: r.title, price: parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')) || null,
-      soldQuantity: null, totalReviews: null, freeShipping: false, rating: r.rating || null
-    }))
+    pctFull: allResults.length ? +(metricas20.full / allResults.length * 100).toFixed(1) : 0,
+    pctFreteGratis: allResults.length ? +(metricas20.freteGratis / allResults.length * 100).toFixed(1) : 0,
+    pctPromocao: allResults.length ? +(metricas20.promocao / allResults.length * 100).toFixed(1) : 0,
+    pctOficiais: allResults.length ? +(metricas20.oficiais / allResults.length * 100).toFixed(1) : 0,
+
+    topSellers,
+    melhoresAnuncios
   };
 }
 
 export async function handleMarket(req, res) {
   const { product } = req.body || {};
   if (!product) return res.status(400).json({ error: 'product obrigatório' });
+
   try {
     const data = await fetchMarketData(product);
-    if (!data.prices && !data.topSellers.length) {
-      const serpData = await fetchSerpApi(product).catch(()=>null);
-      if (serpData) return res.json(serpData);
-    }
     return res.json(data);
   } catch(err) {
     console.error('Market error:', err.message);
-    const serpData = await fetchSerpApi(product).catch(()=>null);
-    if (serpData) return res.json(serpData);
     return res.status(500).json({ error: err.message });
   }
 }
