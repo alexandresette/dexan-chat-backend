@@ -1,5 +1,5 @@
-// routes/market.js — DEXAN Backend v5.0
-// API ML real: domain_discovery + highlights + products/items + reviews + seller_reputation
+// routes/market.js — DEXAN Backend v6.0
+// API ML real: domain_discovery + highlights + products/items + reviews + seller + peso/dim + visitas
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '3701874079446192';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'e5ZtVNh1Ltag4kGCKlwRFQuoG7zv0C3a';
@@ -34,6 +34,53 @@ async function mlFetchSafe(url) {
   try { return await mlFetch(url); } catch(e) { return null; }
 }
 
+// Extrair peso/dimensão dos atributos do produto
+function extractPesoFromAttributes(attrs = []) {
+  const pesoAttr = attrs.find(a => a.name?.toLowerCase().includes('peso') || a.id === 'WEIGHT');
+  const altAttr  = attrs.find(a => a.name?.toLowerCase().includes('altura') || a.id === 'HEIGHT');
+  const largAttr = attrs.find(a => a.name?.toLowerCase().includes('largura') || a.id === 'WIDTH');
+  const compAttr = attrs.find(a => a.name?.toLowerCase().includes('comprimento') || a.id === 'LENGTH');
+
+  const parseVal = (attr) => {
+    if (!attr) return null;
+    const match = attr.value_name?.match(/([\d.,]+)/);
+    return match ? parseFloat(match[1].replace(',', '.')) : null;
+  };
+
+  const pesoKg  = parseVal(pesoAttr);
+  const altCm   = parseVal(altAttr);
+  const largCm  = parseVal(largAttr);
+  const compCm  = parseVal(compAttr);
+
+  // Classificação operacional DEXAN
+  let categoriaOperacional = 'desconhecido';
+  if (pesoKg !== null) {
+    if (pesoKg <= 0.5)      categoriaOperacional = 'mini';     // ideal - PAC até R$15
+    else if (pesoKg <= 1.5) categoriaOperacional = 'leve';     // bom  - PAC até R$25
+    else if (pesoKg <= 5)   categoriaOperacional = 'medio';    // ok   - R$30-60
+    else                    categoriaOperacional = 'pesado';   // ruim - R$60+
+  }
+
+  return { pesoKg, altCm, largCm, compCm, categoriaOperacional };
+}
+
+// Estimativa de vendas/mês via visitas (conversão ~2-5%)
+function estimarVendasMes(visitasMes, totalReviews) {
+  if (!visitasMes && !totalReviews) return null;
+  if (visitasMes) {
+    // Taxa de conversão típica ML: 2-4%
+    const estimativaMin = Math.round(visitasMes * 0.02);
+    const estimativaMax = Math.round(visitasMes * 0.04);
+    return { visitasMes, estimativaMin, estimativaMax, fonte: 'visitas_reais' };
+  }
+  // Proxy: reviews acumuladas / 12 meses (estimativa conservadora)
+  if (totalReviews) {
+    const estimativa = Math.round(totalReviews / 12);
+    return { estimativa, fonte: 'reviews_proxy' };
+  }
+  return null;
+}
+
 async function fetchMarketData(product) {
   // 1. Descobrir categoria exata
   const discovery = await mlFetch(
@@ -45,106 +92,118 @@ async function fetchMarketData(product) {
 
   // 2. Total de anúncios + highlights em paralelo
   const [catData, hlData] = await Promise.all([
-    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/categories/${categoryId}`) : Promise.resolve(null),
-    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/highlights/MLB/category/${categoryId}`) : Promise.resolve(null)
+    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/categories/${categoryId}`) : null,
+    categoryId ? mlFetchSafe(`https://api.mercadolibre.com/highlights/MLB/category/${categoryId}`) : null
   ]);
-
   const totalAnuncios = catData?.total_items_in_this_category || null;
 
-  // 3. Filtrar IDs de produtos do catálogo (tipo PRODUCT)
+  // 3. Top produtos do catálogo (highlights)
   const productIds = (hlData?.content || [])
-    .filter(c => c.type === 'PRODUCT' && c.id?.startsWith('MLB'))
+    .filter(c => c.type === 'PRODUCT' && c.id?.startsWith('MLB') && !c.id.startsWith('MLBU'))
     .map(c => c.id)
     .slice(0, 6);
 
-  // 4. Para cada produto, buscar o item vencedor (buy box)
+  // 4. Buscar item vencedor de cada produto
   const productItemsRaw = await Promise.all(
     productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}/items?limit=1`))
   );
-
-  // 5. Extrair dados de cada item vencedor
   const itemDataList = productItemsRaw
     .filter(d => d?.results?.length > 0)
     .map(d => d.results[0]);
 
-  // 6. Buscar reviews de cada item vencedor em paralelo (reviews = proxy de popularidade)
+  // 5. DADOS COMPLETOS DO LÍDER (primeiro da lista)
+  const liderItem = itemDataList[0] || null;
+  const liderProdId = productIds[0] || null;
+
+  // 5a. Reviews + rating do líder
+  const liderReviews = liderItem ? await mlFetchSafe(
+    `https://api.mercadolibre.com/reviews/item/${liderItem.item_id}`
+  ) : null;
+
+  // 5b. Visitas 30 dias do líder (estimativa de vendas/mês)
+  const liderVisitas = liderItem ? await mlFetchSafe(
+    `https://api.mercadolibre.com/items/${liderItem.item_id}/visits/time_window?last=30&unit=day`
+  ) : null;
+
+  // 5c. Atributos do produto (peso, dimensões) do produto catálogo líder
+  const liderProdDetails = liderProdId ? await mlFetchSafe(
+    `https://api.mercadolibre.com/products/${liderProdId}?fields=id,name,attributes`
+  ) : null;
+
+  // 5d. Seller do líder
+  const liderSellerId = liderItem?.seller_id;
+  const liderSeller = liderSellerId ? await mlFetchSafe(
+    `https://api.mercadolibre.com/users/${liderSellerId}?attributes=id,nickname,seller_reputation`
+  ) : null;
+
+  // 6. Reviews dos demais sellers em paralelo
   const itemIds = itemDataList.map(i => i.item_id).filter(Boolean);
   const reviewsData = await Promise.all(
     itemIds.map(iid => mlFetchSafe(`https://api.mercadolibre.com/reviews/item/${iid}`))
   );
 
-  // 7. Buscar seller_reputation em paralelo para os top sellers
-  const sellerIds = [...new Set(itemDataList.map(i => i.seller_id).filter(Boolean))].slice(0, 3);
+  // 7. Seller reputation dos demais
+  const sellerIds = [...new Set(itemDataList.map(i => i.seller_id).filter(Boolean))];
   const sellerData = await Promise.all(
     sellerIds.map(sid => mlFetchSafe(`https://api.mercadolibre.com/users/${sid}?attributes=id,nickname,seller_reputation`))
   );
   const sellerMap = {};
-  sellerData.filter(Boolean).forEach(s => {
-    if (s.id) sellerMap[s.id] = s;
-  });
+  sellerData.filter(Boolean).forEach(s => { if (s.id) sellerMap[s.id] = s; });
 
-  // 8. Montar lista de top sellers com dados combinados
-  const items = itemDataList.map((item, idx) => {
-    const prodId = productIds[idx];
-    const reviews = reviewsData[idx];
-    const seller = sellerMap[item.seller_id];
-    const totalReviews = reviews?.paging?.total || null;
-    const ratingLider = reviews?.rating_average || null;
-    const sellerRep = seller?.seller_reputation;
-    const sellerLevel = sellerRep?.level_id || null; // '5_green' = platinum
-    const sellerTotalVendas = sellerRep?.transactions?.total || null;
-
-    return {
-      id:           item.item_id,
-      title:        null, // não disponível no products/items - buscar via products
-      price:        item.price,
-      originalPrice: item.original_price,
-      soldQuantity: null, // não disponível via app token
-      totalReviews,
-      ratingLider,
-      totalReviews_proxy: true, // proxy: número de avaliações do produto
-      sellerTotalVendas,  // vendas históricas do vendedor
-      sellerLevel,        // nível do seller (5_green = platinum)
-      sellerNickname: seller?.nickname || null,
-      freeShipping: item.shipping?.free_shipping || false,
-      fulfillment:  item.shipping?.logistic_type === 'fulfillment',
-      condition:    item.condition,
-      link:         `https://www.mercadolivre.com.br/p/${prodId}`
-    };
-  });
-
-  // 9. Buscar títulos dos produtos de catálogo diretamente
+  // 8. Títulos dos produtos de catálogo
   const prodDetails = await Promise.all(
     productIds.map(pid => mlFetchSafe(`https://api.mercadolibre.com/products/${pid}?fields=id,name,attributes`))
   );
-  prodDetails.forEach((p, i) => {
-    if (!items[i]) return;
-    if (p?.name) items[i].title = p.name;
-    const pesoAttr = p?.attributes?.find(a => a.id === 'WEIGHT' || (a.name && a.name.toLowerCase().includes('peso')));
-    if (pesoAttr?.value_name) {
-      items[i].pesoStr = pesoAttr.value_name;
-      const m = pesoAttr.value_name.match(/([\d.,]+)\s*(kg|g)/i);
-      if (m) items[i].pesoKg = m[2].toLowerCase()==='kg' ? parseFloat(m[1].replace(',','.')) : parseFloat(m[1].replace(',','.'))/1000;
-    }
+
+  // 9. Montar items
+  const items = itemDataList.map((item, idx) => {
+    const reviews = reviewsData[idx];
+    const seller  = sellerMap[item.seller_id] || (idx === 0 ? liderSeller : null);
+    const prod    = prodDetails[idx];
+    const pesoInfo = extractPesoFromAttributes(prod?.attributes || []);
+
+    return {
+      id:             item.item_id,
+      title:          prod?.name || null,
+      price:          item.price,
+      originalPrice:  item.original_price,
+      soldQuantity:   null,
+      totalReviews:   reviews?.paging?.total || null,
+      ratingAvg:      reviews?.rating_average || null,
+      sellerTotalVendas: seller?.seller_reputation?.transactions?.total || null,
+      sellerLevel:    seller?.seller_reputation?.level_id || null,
+      sellerNickname: seller?.nickname || null,
+      freeShipping:   item.shipping?.free_shipping || false,
+      fulfillment:    item.shipping?.logistic_type === 'fulfillment',
+      condition:      item.condition,
+      pesoKg:         pesoInfo.pesoKg,
+      categoriaOperacional: pesoInfo.categoriaOperacional,
+      link:           `https://www.mercadolivre.com.br/p/${productIds[idx] || item.item_id}`
+    };
   });
 
-  // 10. Calcular métricas
+  // 10. Dados do LÍDER (extra)
+  const liderPeso = extractPesoFromAttributes(liderProdDetails?.attributes || []);
+  const liderVendasEstimada = estimarVendasMes(
+    liderVisitas?.total_visits || null,
+    liderReviews?.paging?.total || null
+  );
+  const liderRating = liderReviews?.rating_average || null;
+  const liderTotalReviews = liderReviews?.paging?.total || null;
+
+  // 11. Métricas gerais
   const precos = items.map(i => i.price).filter(p => p != null && p > 0 && p < 100000);
   const avgPreco = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
   const freteCount = items.filter(i => i.freeShipping).length;
   const freeShippingPct = items.length ? Math.round((freteCount/items.length)*100) : 0;
-  const maxReviews = items.some(i => i.totalReviews) ? Math.max(...items.filter(i=>i.totalReviews).map(i=>i.totalReviews)) : null;
-  const lider = [...items].sort((a,b)=>(b.totalReviews||0)-(a.totalReviews||0))[0] || null;
-  const avaliacaoLider = lider?.ratingLider || null;
-  const pesoLider = lider?.pesoKg || null;
+  const maxReviews = Math.max(...items.map(i => i.totalReviews || 0).filter(v => v > 0), 0) || null;
 
-  // Ordenar por reviews (proxy de vendas)
   const topSellers = [...items]
     .sort((a,b) => (b.totalReviews||0) - (a.totalReviews||0))
     .slice(0, 6);
 
   return {
-    source: 'ml_api_v5',
+    source: 'ml_api_v6',
     query: product,
     categoryId,
     categoryName,
@@ -157,8 +216,25 @@ async function fetchMarketData(product) {
       max: +Math.max(...precos).toFixed(2)
     } : null,
     freeShippingPct,
-    maxVendidosMes: null, // API ML não expõe via app token sem permissão especial
-    maxReviews,           // proxy de popularidade
+    maxVendidosMes: null,
+    maxReviews,
+
+    // ── DADOS DO LÍDER (para preencher Metrify automaticamente) ──
+    lider: {
+      titulo:          items[0]?.title || null,
+      preco:           items[0]?.price || null,
+      ratingAvg:       liderRating,           // ⭐ avaliação real
+      totalReviews:    liderTotalReviews,
+      visitasMes:      liderVisitas?.total_visits || null,
+      vendasEstimada:  liderVendasEstimada,   // 📦 vendas/mês estimadas
+      pesoKg:          liderPeso.pesoKg,      // ⚖️ peso real do produto
+      categoriaOp:     liderPeso.categoriaOperacional, // mini/leve/medio/pesado
+      fulfillment:     items[0]?.fulfillment || false,
+      sellerNickname:  items[0]?.sellerNickname || null,
+      sellerLevel:     items[0]?.sellerLevel || null,
+      sellerVendas:    items[0]?.sellerTotalVendas || null,
+    },
+
     topSellers
   };
 }
@@ -176,10 +252,9 @@ async function fetchSerpApi(product) {
   const precos = results.map(r=>parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.'))).filter(p=>!isNaN(p)&&p>0);
   const avg = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
   return {
-    source: 'serpapi_fallback',
-    query: product, totalItems: null,
+    source: 'serpapi_fallback', query: product, totalItems: null,
     prices: avg ? { avg: +avg.toFixed(2), min: Math.min(...precos), max: Math.max(...precos) } : null,
-    freeShippingPct: 0, maxVendidosMes: null, maxReviews: null,
+    freeShippingPct: 0, maxVendidosMes: null, maxReviews: null, lider: null,
     topSellers: results.slice(0,5).map(r=>({
       title: r.title, price: parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')) || null,
       soldQuantity: null, totalReviews: null, freeShipping: false, rating: r.rating || null
@@ -187,7 +262,7 @@ async function fetchSerpApi(product) {
   };
 }
 
-async function handleMarket(req, res) {
+export async function handleMarket(req, res) {
   const { product } = req.body || {};
   if (!product) return res.status(400).json({ error: 'product obrigatório' });
   try {
@@ -204,5 +279,3 @@ async function handleMarket(req, res) {
     return res.status(500).json({ error: err.message });
   }
 }
-
-export { handleMarket };
