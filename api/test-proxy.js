@@ -1,5 +1,5 @@
-// api/test-proxy.js v3 — usando undici ProxyAgent (built-in Node 18)
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
+// api/test-proxy.js v4 — undici ProxyAgent com import correto
+import { ProxyAgent } from 'undici';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -10,18 +10,15 @@ export default async function handler(req, res) {
   const port = process.env.IPROYAL_PORT || '12321';
   const logs = [];
 
-  logs.push(`user=${user?.substring(0,8)}... pass len=${pass?.length} host=${host}:${port}`);
-
+  logs.push(`user=${user?.substring(0,8)}... pass_len=${pass?.length} ${host}:${port}`);
   if (!user || !pass) return res.json({ ok: false, logs, error: 'Credenciais faltando' });
 
   try {
     const proxyUrl = `http://${user}:${encodeURIComponent(pass)}@${host}:${port}`;
-    logs.push(`Criando ProxyAgent: ${host}:${port}`);
-
     const agent = new ProxyAgent(proxyUrl);
+    logs.push('ProxyAgent criado, fazendo request...');
 
-    logs.push('Fazendo request ML via proxy...');
-    const response = await undiciFetch(
+    const response = await fetch(
       'https://api.mercadolibre.com/sites/MLB/search?q=colete+de+peso&limit=3',
       {
         dispatcher: agent,
@@ -29,22 +26,19 @@ export default async function handler(req, res) {
       }
     );
 
-    logs.push(`ML status: ${response.status}`);
+    logs.push(`ML HTTP status: ${response.status}`);
 
     if (response.status === 200) {
       const data = await response.json();
-      const items = data.results || [];
-      logs.push(`✅ ML retornou ${items.length} itens! Total: ${data.paging?.total}`);
+      logs.push(`✅ ${data.results?.length} itens! Total ML: ${data.paging?.total}`);
       return res.json({
         ok: true, logs,
         total: data.paging?.total,
-        items: items.slice(0,3).map(i => ({ title: i.title, price: i.price, sold: i.sold_quantity }))
+        items: data.results?.slice(0,3).map(i => ({ title: i.title, price: i.price, sold: i.sold_quantity }))
       });
-    } else {
-      const body = await response.text();
-      logs.push(`Erro ML: ${body.substring(0,200)}`);
-      return res.json({ ok: false, logs, mlStatus: response.status });
     }
+    const body = await response.text();
+    return res.json({ ok: false, logs, mlStatus: response.status, body: body.substring(0,300) });
 
   } catch(e) {
     logs.push(`ERRO: ${e.message}`);
