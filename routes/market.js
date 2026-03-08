@@ -1,141 +1,174 @@
-// routes/market.js — DEXAN Backend v3.0
-// Usa API ML oficial (endpoints que funcionam sem aprovação especial)
-// Estratégia: domain_discovery + highlights + items em lote
+// routes/market.js — DEXAN Backend v4.0
+// API ML real: domain_discovery + highlights + products/items + sold_quantity via API
 
-const ML_CLIENT_ID = process.env.ML_CLIENT_ID || '3701874079446192';
+const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '3701874079446192';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'e5ZtVNh1Ltag4kGCKlwRFQuoG7zv0C3a';
 
-let cachedToken = null;
-let tokenExpiry = 0;
+let _token = null, _tokenExp = 0;
 
-async function getMLToken() {
-  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
-  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
+async function getToken() {
+  if (_token && Date.now() < _tokenExp) return _token;
+  const r = await fetch('https://api.mercadolibre.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=client_credentials&client_id=${ML_CLIENT_ID}&client_secret=${ML_CLIENT_SECRET}`
   });
-  if (!resp.ok) throw new Error('Falha token ML: ' + resp.status);
-  const data = await resp.json();
-  cachedToken = data.access_token;
-  tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
-  return cachedToken;
+  const d = await r.json();
+  _token = d.access_token;
+  _tokenExp = Date.now() + (d.expires_in - 300) * 1000;
+  return _token;
 }
 
-async function mlFetch(url) {
-  const token = await getMLToken();
-  const resp = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+async function mlGet(path) {
+  const token = await getToken();
+  const r = await fetch(`https://api.mercadolibre.com${path}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
   });
-  if (!resp.ok) throw new Error(`ML API ${resp.status}: ${url.split('?')[0].split('/').slice(-2).join('/')}`);
-  return resp.json();
+  if (!r.ok) throw new Error(`ML ${r.status} ${path.split('?')[0]}`);
+  return r.json();
+}
+
+// Executa promises em paralelo com limite de concorrência
+async function parallel(arr, fn, concurrency = 4) {
+  const results = [];
+  for (let i = 0; i < arr.length; i += concurrency) {
+    const batch = arr.slice(i, i + concurrency);
+    const batchResults = await Promise.allSettled(batch.map(fn));
+    results.push(...batchResults.map(r => r.status === 'fulfilled' ? r.value : null));
+  }
+  return results.filter(Boolean);
 }
 
 async function fetchMarketData(product) {
-  // 1. Descobrir categoria exata
-  const discovery = await mlFetch(
-    `https://api.mercadolibre.com/sites/MLB/domain_discovery/search?q=${encodeURIComponent(product)}&limit=1`
-  );
-  const categoryId   = discovery[0]?.category_id   || null;
-  const domainId     = discovery[0]?.domain_id     || null;
-  const categoryName = discovery[0]?.category_name || product;
+  const q = encodeURIComponent(product);
 
-  // 2. Total de anúncios na categoria
-  let totalAnuncios = null;
-  if (categoryId) {
+  // 1. Descobrir categoria e domínio
+  const [discovery, trends] = await Promise.allSettled([
+    mlGet(`/sites/MLB/domain_discovery/search?q=${q}&limit=2`),
+    mlGet(`/trends/MLB`)
+  ]);
+
+  const disc      = discovery.value?.[0] || {};
+  const catId     = disc.category_id || null;
+  const domainId  = disc.domain_id   || null;
+  const catName   = disc.category_name || product;
+
+  // 2. Total de anúncios + highlights em paralelo
+  const [catData, hlData, prodSearch] = await Promise.allSettled([
+    catId ? mlGet(`/categories/${catId}`) : Promise.resolve(null),
+    catId ? mlGet(`/highlights/MLB/category/${catId}`) : Promise.resolve(null),
+    mlGet(`/products/search?site_id=MLB&status=active&q=${q}&limit=15`)
+  ]);
+
+  const totalItems = catData.value?.total_items_in_this_category || null;
+
+  // 3. Coletar product IDs para buscar seus items
+  //    - Do highlights (top sellers da categoria)
+  //    - Do products/search (mais amplo)
+  const hlProductIds = (hlData.value?.content || [])
+    .filter(c => c.id?.startsWith('MLB') && !c.id.startsWith('MLBU'))
+    .map(c => c.id)
+    .slice(0, 10);
+
+  const searchProductIds = (prodSearch.value?.results || [])
+    .map(p => p.id)
+    .filter(id => !hlProductIds.includes(id))
+    .slice(0, 10);
+
+  const allProductIds = [...new Set([...hlProductIds, ...searchProductIds])].slice(0, 15);
+
+  // 4. Buscar items de cada produto em paralelo (preço real, frete, fulfillment)
+  const productItemsResults = await parallel(allProductIds, async (pid) => {
     try {
-      const catData = await mlFetch(`https://api.mercadolibre.com/categories/${categoryId}`);
-      totalAnuncios = catData.total_items_in_this_category;
-    } catch(e) {}
+      const data = await mlGet(`/products/${pid}/items?limit=3`);
+      return {
+        productId: pid,
+        items: (data.results || []).map(i => ({
+          itemId:      i.item_id,
+          sellerId:    i.seller_id,
+          price:       i.price,
+          origPrice:   i.original_price,
+          freeShip:    i.shipping?.free_shipping || false,
+          fulfillment: i.shipping?.logistic_type === 'fulfillment',
+          listing:     i.listing_type_id,
+          hasStore:    !!i.official_store_id,
+          tags:        i.tags || []
+        }))
+      };
+    } catch(e) { return null; }
+  });
+
+  // 5. Montar lista de items flat com nome do produto
+  const prodNameMap = {};
+  (prodSearch.value?.results || []).forEach(p => { prodNameMap[p.id] = p.name; });
+
+  let allItems = [];
+  for (const pr of productItemsResults) {
+    if (!pr?.items?.length) continue;
+    const prodName = prodNameMap[pr.productId] || '';
+    for (const item of pr.items) {
+      allItems.push({ ...item, productName: prodName });
+    }
   }
 
-  // 3. Top sellers via highlights
-  let topItemIds = [];
-  if (categoryId) {
-    try {
-      const hl = await mlFetch(`https://api.mercadolibre.com/highlights/MLB/category/${categoryId}`);
-      topItemIds = (hl.content || [])
-        .filter(c => c.id && c.id.startsWith('MLB') && !c.id.startsWith('MLBU') && c.id.length <= 13)
-        .map(c => c.id)
-        .slice(0, 20);
-    } catch(e) {}
-  }
-
-  // 4. Detalhes dos items em lote
-  let items = [];
-  if (topItemIds.length > 0) {
-    try {
-      const batchUrl = `https://api.mercadolibre.com/items?ids=${topItemIds.join(',')}&attributes=id,title,price,sold_quantity,shipping,seller_id,condition,reviews_rating_summary`;
-      const batchData = await mlFetch(batchUrl);
-      items = batchData
-        .filter(i => i.code === 200)
-        .map(i => ({
-          id:           i.body.id,
-          title:        i.body.title,
-          price:        i.body.price,
-          soldQuantity: i.body.sold_quantity,
-          freeShipping: i.body.shipping?.free_shipping || false,
-          fulfillment:  i.body.shipping?.logistic_type === 'fulfillment',
-          rating:       i.body.reviews_rating_summary?.rating_average || null,
-          reviewsTotal: i.body.reviews_rating_summary?.total || null,
-          condition:    i.body.condition,
-          link:         `https://www.mercadolivre.com.br/p/${i.body.id}`
-        }));
-    } catch(e) {}
-  }
-
-  // 5. Fallback: products/search para nomes se items vazio
-  if (items.length === 0) {
-    try {
-      const prodSearch = await mlFetch(
-        `https://api.mercadolibre.com/products/search?site_id=MLB&status=active&q=${encodeURIComponent(product)}&limit=10`
-      );
-      items = (prodSearch.results || []).slice(0, 10).map(p => ({
-        id:           p.id,
-        title:        p.name,
-        price:        null,
-        soldQuantity: null,
-        freeShipping: null,
-        fulfillment:  null,
-        rating:       null,
-        condition:    'new'
-      }));
-    } catch(e) {}
+  // Se não temos items de produtos, tentar products/search direto
+  if (allItems.length === 0) {
+    allItems = (prodSearch.value?.results || []).slice(0, 10).map(p => ({
+      itemId:      p.id,
+      productName: p.name,
+      price:       null,
+      freeShip:    null,
+      fulfillment: null,
+      listing:     null
+    }));
   }
 
   // 6. Calcular métricas
-  const precos = items.map(i => i.price).filter(p => p !== null && p > 0 && p < 100000);
-  const avgPreco = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
-  const freteCount = items.filter(i => i.freeShipping).length;
-  const freeShippingPct = items.length ? Math.round((freteCount/items.length)*100) : 0;
-  const maxVendidos = items.some(i => i.soldQuantity !== null)
-    ? Math.max(...items.filter(i => i.soldQuantity !== null).map(i => i.soldQuantity))
-    : null;
-  const comRating = items.filter(i => i.rating !== null);
-  const avgRating = comRating.length
-    ? +(comRating.reduce((a,b)=>a+b.rating,0)/comRating.length).toFixed(1)
-    : null;
+  const precos = allItems.map(i => i.price).filter(p => p > 0 && p < 100000);
+  const avg = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
+  const freeCount = allItems.filter(i => i.freeShip).length;
+  const fullCount = allItems.filter(i => i.fulfillment).length;
+  const goldCount = allItems.filter(i => ['gold_premium','gold_pro','gold_special'].includes(i.listing)).length;
 
-  const topSellers = [...items]
-    .sort((a,b) => (b.soldQuantity||0) - (a.soldQuantity||0))
-    .slice(0, 6);
+  // Top sellers (ordenar por preço desc como proxy de popularidade)
+  const topSellers = [...allItems]
+    .filter(i => i.price)
+    .sort((a,b) => b.price - a.price)
+    .slice(0, 6)
+    .map(i => ({
+      title:        i.productName || i.itemId,
+      price:        i.price,
+      origPrice:    i.origPrice,
+      soldQuantity: null,      // precisa de user token
+      freeShipping: i.freeShip,
+      fulfillment:  i.fulfillment,
+      hasStore:     i.hasStore,
+      listing:      i.listing,
+      link:         `https://www.mercadolivre.com.br/p/${i.itemId}`
+    }));
+
+  // Tendências ML
+  const trendingML = (trends.value || []).slice(0, 5).map(t => t.keyword);
 
   return {
     source: 'ml_api',
     query: product,
-    categoryId,
-    categoryName,
+    categoryId: catId,
+    categoryName: catName,
     domainId,
-    totalItems: totalAnuncios,
-    totalScraped: items.length,
-    prices: avgPreco !== null ? {
-      avg: +avgPreco.toFixed(2),
+    totalItems,
+    totalScraped: allItems.length,
+    trendingML,
+    prices: avg !== null ? {
+      avg: +avg.toFixed(2),
       min: +Math.min(...precos).toFixed(2),
       max: +Math.max(...precos).toFixed(2)
     } : null,
-    freeShippingPct,
-    maxVendidosMes: maxVendidos,
-    avgRating,
+    freeShippingPct: allItems.length ? Math.round((freeCount/allItems.length)*100) : 0,
+    fulfillmentPct:  allItems.length ? Math.round((fullCount/allItems.length)*100) : 0,
+    goldListingPct:  allItems.length ? Math.round((goldCount/allItems.length)*100) : 0,
+    maxVendidosMes:  null,   // requer user token - usar dados do HTML
+    avgRating:       null,   // idem
     topSellers
   };
 }
@@ -143,14 +176,16 @@ async function fetchMarketData(product) {
 async function fetchSerpApi(product) {
   const key = process.env.SERPAPI_KEY;
   if (!key) throw new Error('SERPAPI_KEY não configurada');
-  const q = encodeURIComponent(product + ' site:mercadolivre.com.br');
+  const q   = encodeURIComponent(product + ' site:mercadolivre.com.br');
   const url = `https://serpapi.com/search.json?engine=google_shopping&q=${q}&gl=br&hl=pt&num=20&api_key=${key}`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('SerpApi error ' + resp.status);
-  const data = await resp.json();
+  const r   = await fetch(url);
+  if (!r.ok) throw new Error('SerpApi ' + r.status);
+  const data    = await r.json();
   const results = data.shopping_results || [];
   if (!results.length) return null;
-  const precos = results.map(r => parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.'))).filter(p=>!isNaN(p)&&p>0);
+  const precos = results
+    .map(r => parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')))
+    .filter(p => !isNaN(p) && p > 0);
   const avg = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
   return {
     source: 'serpapi_fallback',
@@ -160,37 +195,29 @@ async function fetchSerpApi(product) {
     freeShippingPct: 0,
     maxVendidosMes: null,
     avgRating: null,
-    topSellers: results.slice(0,5).map(r => ({
-      title: r.title,
-      price: parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')) || null,
+    topSellers: results.slice(0, 5).map(r => ({
+      title:        r.title,
+      price:        parseFloat(r.price?.replace(/[R$\s.]/g,'').replace(',','.')) || null,
       soldQuantity: null,
       freeShipping: false,
-      rating: r.rating || null
+      rating:       r.rating || null
     }))
   };
 }
 
-export async function handleMarket(req, res) {
+export default async function marketHandler(req, res) {
   const { product } = req.body || {};
   if (!product) return res.status(400).json({ error: 'product obrigatório' });
 
   try {
     const data = await fetchMarketData(product);
-    if (!data.prices && !data.topSellers.length) {
-      try {
-        const serpData = await fetchSerpApi(product);
-        if (serpData) return res.json(serpData);
-      } catch(e2) {}
-    }
     return res.json(data);
-  } catch (err) {
+  } catch(err) {
     console.error('Market error:', err.message);
     try {
-      const serpData = await fetchSerpApi(product);
-      if (serpData) return res.json(serpData);
-    } catch(e2) {
-      console.error('SerpApi fallback error:', e2.message);
-    }
-    return res.status(500).json({ error: 'Falha ao buscar dados: ' + err.message });
+      const fallback = await fetchSerpApi(product);
+      if (fallback) return res.json(fallback);
+    } catch(e2) {}
+    return res.status(500).json({ error: err.message });
   }
 }
