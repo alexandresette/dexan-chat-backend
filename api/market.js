@@ -1,17 +1,69 @@
-// api/market.js — DEXAN Backend v7
-// ML API via proxy residencial BR (IPRoyal) usando undici + fallback SerpApi
+// api/market.js — DEXAN Backend v8
+// ML API via proxy IPRoyal usando https.request nativo do Node + fallback SerpApi
 
-import { ProxyAgent, fetch as uFetch } from 'undici';
+import https from 'https';
+import http from 'http';
+import { URL } from 'url';
 
-function getProxyFetch() {
-  const user = process.env.IPROYAL_USER;
-  const pass = process.env.IPROYAL_PASS;
-  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
-  const port = process.env.IPROYAL_PORT || '12321';
-  if (!user || !pass) return null;
+function fetchViaProxy(targetUrl, proxyUrl) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(targetUrl);
+    const proxy  = new URL(proxyUrl);
 
-  const dispatcher = new ProxyAgent(`http://${user}:${pass}@${host}:${port}`);
-  return (url, opts = {}) => uFetch(url, { ...opts, dispatcher });
+    // HTTP CONNECT tunnel para HTTPS
+    const connectReq = http.request({
+      host: proxy.hostname,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: `${target.hostname}:443`,
+      headers: {
+        'Proxy-Authorization': 'Basic ' + Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64'),
+        'Host': target.hostname
+      }
+    });
+
+    connectReq.setTimeout(15000, () => { connectReq.destroy(); reject(new Error('Proxy connect timeout')); });
+
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+      }
+
+      const getReq = https.request({
+        host: target.hostname,
+        path: target.pathname + target.search,
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Host': target.hostname
+        },
+        socket,
+        agent: false
+      });
+
+      getReq.setTimeout(15000, () => { getReq.destroy(); reject(new Error('Request timeout')); });
+
+      getReq.on('response', (resp) => {
+        let body = '';
+        resp.on('data', d => body += d);
+        resp.on('end', () => {
+          if (resp.statusCode !== 200) {
+            return reject(new Error(`HTTP ${resp.statusCode}: ${body.substring(0,100)}`));
+          }
+          try { resolve(JSON.parse(body)); }
+          catch(e) { reject(new Error('JSON parse error: ' + body.substring(0,100))); }
+        });
+      });
+
+      getReq.on('error', reject);
+      getReq.end();
+    });
+
+    connectReq.on('error', reject);
+    connectReq.end();
+  });
 }
 
 export default async function handler(req, res) {
@@ -34,32 +86,30 @@ export default async function handler(req, res) {
 }
 
 async function fetchML(product) {
-  const proxyFetch = getProxyFetch();
+  const user = process.env.IPROYAL_USER;
+  const pass = process.env.IPROYAL_PASS;
+  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
+  const port = process.env.IPROYAL_PORT || '12321';
 
-  if (proxyFetch) {
+  if (user && pass) {
     try {
+      const proxyUrl = `http://${user}:${encodeURIComponent(pass)}@${host}:${port}`;
       const q = encodeURIComponent(product);
-      const url = `https://api.mercadolibre.com/sites/MLB/search?q=${q}&limit=20&sort=relevance`;
-      const resp = await proxyFetch(url, {
-        headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        const items = data.results || [];
-        if (items.length > 0) {
-          console.log(`✅ ML via IPRoyal: ${items.length} items`);
-          return formatMLNative(product, items, data.paging?.total);
-        }
-        console.log('ML proxy retornou vazio, status:', resp.status);
-      } else {
-        const txt = await resp.text().catch(() => '');
-        console.log(`ML proxy HTTP ${resp.status}:`, txt.substring(0, 100));
+      const targetUrl = `https://api.mercadolibre.com/sites/MLB/search?q=${q}&limit=20&sort=relevance`;
+
+      const data = await fetchViaProxy(targetUrl, proxyUrl);
+      const items = data.results || [];
+
+      if (items.length > 0) {
+        console.log(`✅ ML via IPRoyal proxy: ${items.length} items`);
+        return formatMLNative(product, items, data.paging?.total);
       }
+      console.log('ML proxy retornou 0 itens');
     } catch (e) {
-      console.log('Proxy erro:', e.message);
+      console.log('Proxy falhou:', e.message, '— usando SerpApi');
     }
   } else {
-    console.log('Sem credenciais IPRoyal, usando SerpApi');
+    console.log('Sem credenciais proxy, usando SerpApi');
   }
 
   return fetchMLViaSerpApi(product);
