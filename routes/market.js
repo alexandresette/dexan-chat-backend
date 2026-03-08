@@ -67,9 +67,17 @@ export async function handleMarket(req, res) {
     const hasUserToken = !!getUserToken();
     console.log(`Busca "${product}" — token: ${hasUserToken ? 'OAuth usuário ✅' : 'client_credentials ⚠️'}`);
 
-    const data = hasUserToken
-      ? await fetchWithUserToken(product)
-      : await fetchWithAppToken(product);
+    let data;
+    try {
+      // Tenta sempre o /sites/MLB/search com OAuth (se disponível) ou client_credentials
+      data = hasUserToken
+        ? await fetchWithUserToken(product)
+        : await fetchWithAppToken(product);
+    } catch(primaryErr) {
+      // Se /sites/MLB/search bloqueado (403 IP cloud) → fallback garantido para /products/search
+      console.warn('Modo principal falhou, ativando fallback /products/search:', primaryErr.message);
+      data = await fetchWithAppToken(product);
+    }
 
     return res.json(data);
   } catch(err) {
