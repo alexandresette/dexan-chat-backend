@@ -1,9 +1,6 @@
-// routes/market.js — DEXAN Backend v7.0
-// Scraping REAL das 20 páginas ML com keyword exata
-// Dados: total anúncios, lojas oficiais, full, frete grátis, ML líderes,
-//        venda internacional, promoções, mercado endereçável, preço médio p1 e p20
-
-import { ProxyAgent } from 'undici';
+// routes/market.js — DEXAN Backend v7.2
+// Mesma abordagem do v5/v6 que funcionava (domain_discovery + highlights + products/items)
+// NOVO: busca em MÚLTIPLAS categorias + /products/search para mais abrangência
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '3701874079446192';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'e5ZtVNh1Ltag4kGCKlwRFQuoG7zv0C3a';
@@ -25,230 +22,278 @@ async function getMLToken() {
   return cachedToken;
 }
 
-function getProxyAgent() {
-  const user = process.env.IPROYAL_USER;
-  const pass = process.env.IPROYAL_PASS;
-  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
-  const port = process.env.IPROYAL_PORT || '12321';
-  if (!user || !pass) return null;
-  try {
-    return new ProxyAgent({
-      uri: `http://${user}:${pass}@${host}:${port}`,
-      connectTimeout: 20000
-    });
-  } catch(e) {
-    console.warn('Proxy agent error:', e.message);
-    return null;
-  }
-}
-
-async function fetchMLSearchPage(query, offset, token, proxy) {
-  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(query)}&limit=50&offset=${offset}`;
-  const headers = {
-    'Authorization': `Bearer ${token}`,
-    'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (compatible; DEXAN/1.0)'
-  };
-
-  if (proxy) {
-    try {
-      const resp = await fetch(url, { dispatcher: proxy, headers });
-      if (resp.ok) return resp.json();
-      console.warn(`Proxy falhou offset=${offset}: ${resp.status}`);
-    } catch(e) {
-      console.warn(`Proxy erro offset=${offset}: ${e.message}`);
-    }
-  }
-
-  const resp = await fetch(url, { headers });
-  if (!resp.ok) throw new Error(`ML search ${resp.status} offset=${offset}`);
+async function mlFetch(url) {
+  const token = await getMLToken();
+  const resp = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+  });
+  if (!resp.ok) throw new Error(`ML ${resp.status}: ${url.split('?')[0].split('/').slice(-2).join('/')}`);
   return resp.json();
 }
 
-function analyzeResults(results) {
-  const metrics = {
-    count: 0,
-    oficiais: 0,
-    full: 0,
-    freteGratis: 0,
-    mercadoLideres: 0,
-    internacional: 0,
-    promocao: 0,
-    somaPrecos: 0,
-    precos: [],
-    sellers: new Set()
-  };
+async function mlFetchSafe(url) {
+  try { return await mlFetch(url); } catch(e) { return null; }
+}
 
-  for (const item of results) {
-    metrics.count++;
-    const preco = item.price || 0;
-    if (preco > 0 && preco < 500000) {
-      metrics.somaPrecos += preco;
-      metrics.precos.push(preco);
-    }
-
-    if (item.official_store_id || item.official_store_name) metrics.oficiais++;
-
-    const logistic = item.shipping?.logistic_type || '';
-    if (logistic === 'fulfillment') metrics.full++;
-
-    if (item.shipping?.free_shipping) metrics.freteGratis++;
-
-    const level = item.seller?.seller_reputation?.level_id || '';
-    if (level.includes('gold') || level.includes('platinum')) metrics.mercadoLideres++;
-
-    if (item.international_delivery_mode && item.international_delivery_mode !== 'none') {
-      metrics.internacional++;
-    }
-
-    if (item.original_price && item.original_price > item.price) metrics.promocao++;
-
-    if (item.seller?.id) metrics.sellers.add(item.seller.id);
+// Busca em paralelo com limite de concorrência
+async function parallelFetch(urls, concurrency = 10) {
+  const results = [];
+  for (let i = 0; i < urls.length; i += concurrency) {
+    const batch = urls.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(url => mlFetchSafe(url)));
+    results.push(...batchResults);
+    if (i + concurrency < urls.length) await new Promise(r => setTimeout(r, 200));
   }
-
-  return metrics;
+  return results;
 }
 
 async function fetchMarketData(product) {
   const token = await getMLToken();
-  const proxy = getProxyAgent();
+  console.log(`Analisando: "${product}"`);
 
-  console.log(`Buscando "${product}" via ML API...`);
+  // ── 1. Domain discovery: pegar TODAS as categorias relacionadas à keyword ──
+  const dd = await mlFetchSafe(
+    `https://api.mercadolibre.com/sites/MLB/domain_discovery/search?q=${encodeURIComponent(product)}&limit=10`
+  );
+  const categories = (dd || []).map(d => ({
+    id: d.category_id,
+    name: d.category_name,
+    domain: d.domain_id
+  }));
+  
+  // Categoria principal (primeira)
+  const mainCat = categories[0] || { id: null, name: product, domain: null };
+  console.log(`Categorias encontradas: ${categories.map(c => c.name).join(', ')}`);
 
-  let page1;
-  try {
-    page1 = await fetchMLSearchPage(product, 0, token, proxy);
-  } catch(e) {
-    throw new Error(`Falha na busca ML: ${e.message}`);
+  // ── 2. Dados de cada categoria em paralelo ──
+  const [catDataList, hlDataList, psData] = await Promise.all([
+    // Total de itens em cada categoria
+    Promise.all(categories.slice(0,3).map(c =>
+      mlFetchSafe(`https://api.mercadolibre.com/categories/${c.id}`)
+    )),
+    // Highlights de cada categoria
+    Promise.all(categories.slice(0,3).map(c =>
+      mlFetchSafe(`https://api.mercadolibre.com/highlights/MLB/category/${c.id}`)
+    )),
+    // Busca de produtos de catálogo com keyword EXATA (paginação: 4 páginas de 50)
+    Promise.all([0, 50, 100, 150].map(offset =>
+      mlFetchSafe(`https://api.mercadolibre.com/products/search?site_id=MLB&q=${encodeURIComponent(product)}&limit=50&offset=${offset}`)
+    ))
+  ]);
+
+  // Total de resultados da busca keyword exata (do /products/search)
+  const totalBuscaExata = psData[0]?.paging?.total || null;
+
+  // Total de itens na categoria principal
+  const totalNaCategoria = catDataList[0]?.total_items_in_this_category || null;
+
+  // ── 3. Coletar IDs dos highlights (PRODUCT e ITEM types) ──
+  const highlightIds = [];
+  for (const hl of hlDataList) {
+    if (!hl) continue;
+    for (const c of (hl.content || [])) {
+      if (c.id && !highlightIds.includes(c.id)) {
+        highlightIds.push({ id: c.id, type: c.type });
+      }
+    }
   }
 
-  const totalBusca = page1.paging?.total || 0;
-  const resultadosPorPagina = page1.paging?.limit || 50;
-  const queryRetornada = page1.query || product;
-  const nomeCategoria = page1.filters?.find(f => f.id === 'category')?.values?.[0]?.name || null;
+  // ── 4. Produtos de catálogo do /products/search ──
+  const catalogProducts = [];
+  for (const page of psData) {
+    if (page?.results) catalogProducts.push(...page.results);
+  }
+  const catalogProductIds = catalogProducts.map(p => p.id);
 
-  console.log(`Total: ${totalBusca} | Categoria: ${nomeCategoria}`);
+  console.log(`Highlights: ${highlightIds.length} | Catálogo: ${catalogProductIds.length}`);
 
-  const page1Results = page1.results || [];
-  const metricasP1 = analyzeResults(page1Results);
-
-  const maxItems = Math.min(totalBusca, 1000);
-  const totalPaginas = Math.ceil(maxItems / resultadosPorPagina);
-  const paginasParaBuscar = Math.min(totalPaginas, 20);
-
-  const allResults = [...page1Results];
-
-  for (let batchStart = 1; batchStart < paginasParaBuscar; batchStart += 5) {
-    const batchEnd = Math.min(batchStart + 5, paginasParaBuscar);
-    const batch = [];
-
-    for (let p = batchStart; p < batchEnd; p++) {
-      const offset = p * resultadosPorPagina;
-      batch.push(
-        fetchMLSearchPage(product, offset, token, proxy)
-          .then(d => d.results || [])
-          .catch(e => { console.warn(`Pag ${p+1} falhou: ${e.message}`); return []; })
-      );
-    }
-
-    const batchResults = await Promise.all(batch);
-    batchResults.forEach(r => allResults.push(...r));
-
-    if (batchEnd < paginasParaBuscar) await new Promise(r => setTimeout(r, 300));
+  // ── 5. Buscar items de todos os produtos de catálogo em paralelo ──
+  // (mesmo que só ~12% tenham buy_box, coletamos o máximo possível)
+  const productItemUrls = catalogProductIds.slice(0, 100).map(pid =>
+    `https://api.mercadolibre.com/products/${pid}/items?limit=3`
+  );
+  const productItemsRaw = await parallelFetch(productItemUrls, 15);
+  
+  const itemsFromCatalog = [];
+  for (const d of productItemsRaw) {
+    if (d?.results?.length > 0) itemsFromCatalog.push(...d.results);
   }
 
-  console.log(`Items coletados: ${allResults.length}`);
+  // ── 6. Buscar itens diretos dos highlights (tipo ITEM) ──
+  const itemTypeIds = highlightIds.filter(h => h.type === 'ITEM').map(h => h.id);
+  const productTypeIds = highlightIds.filter(h => h.type === 'PRODUCT').map(h => h.id);
 
-  const metricas20 = analyzeResults(allResults);
+  const [itemDirectData, productItemData] = await Promise.all([
+    // Itens diretos (têm todos os dados: preço, frete, seller)
+    parallelFetch(itemTypeIds.slice(0, 20).map(id =>
+      `https://api.mercadolibre.com/items/${id}`
+    ), 10),
+    // Produtos de catálogo dos highlights
+    parallelFetch(productTypeIds.slice(0, 20).map(pid =>
+      `https://api.mercadolibre.com/products/${pid}/items?limit=1`
+    ), 10)
+  ]);
 
-  const precoMedioP1 = metricasP1.precos.length
-    ? metricasP1.precos.reduce((a,b)=>a+b,0) / metricasP1.precos.length : null;
+  const itemsFromHighlightDirect = itemDirectData.filter(Boolean);
+  const itemsFromHighlightProducts = productItemData.flatMap(d => d?.results || []).filter(Boolean);
 
-  const precos20 = metricas20.precos;
-  const precoMedio20 = precos20.length
-    ? precos20.reduce((a,b)=>a+b,0) / precos20.length : null;
+  // ── 7. Consolidar TODOS os items com dados ──
+  const allItems = [
+    ...itemsFromCatalog,
+    ...itemsFromHighlightProducts,
+    ...itemsFromHighlightDirect.map(d => ({
+      item_id: d.id,
+      price: d.price,
+      original_price: d.original_price,
+      seller_id: d.seller_id,
+      official_store_id: d.official_store_id,
+      listing_type_id: d.listing_type_id,
+      shipping: d.shipping,
+      international_delivery_mode: d.international_delivery_mode,
+      condition: d.condition,
+      title: d.title,
+      thumbnail: d.thumbnail,
+      permalink: d.permalink
+    }))
+  ];
 
-  const topMap = {};
-  for (const item of allResults) {
-    const sid = item.seller?.id;
-    if (!sid) continue;
-    if (!topMap[sid]) {
-      topMap[sid] = {
-        sellerNickname: item.seller?.nickname || null,
-        sellerLevel: item.seller?.seller_reputation?.level_id || null,
-        powerStatus: item.seller?.seller_reputation?.power_seller_status || null,
-        count: 0, somaPrecos: 0, topItem: null
-      };
+  // Deduplicar por item_id
+  const seenIds = new Set();
+  const uniqueItems = allItems.filter(i => {
+    const id = i.item_id || i.id;
+    if (!id || seenIds.has(id)) return false;
+    seenIds.add(id);
+    return true;
+  });
+
+  console.log(`Items com dados completos: ${uniqueItems.length}`);
+
+  // ── 8. Calcular métricas ──
+  let totalFull = 0, totalFrete = 0, totalOficiais = 0, totalPromo = 0;
+  let totalIntl = 0, totalMlLideres = 0;
+  const precos = [], sellerIds = new Set(), sellerMap = {};
+
+  for (const item of uniqueItems) {
+    const preco = item.price || 0;
+    if (preco > 0 && preco < 500000) precos.push(preco);
+
+    const logistic = item.shipping?.logistic_type || '';
+    if (logistic === 'fulfillment') totalFull++;
+    if (item.shipping?.free_shipping) totalFrete++;
+    if (item.official_store_id) totalOficiais++;
+    if (item.original_price && item.original_price > item.price) totalPromo++;
+    if (item.international_delivery_mode && item.international_delivery_mode !== 'none') totalIntl++;
+
+    // Gold listing = ML Líder (gold_pro = Platinum, gold_special = Ouro)
+    const lt = item.listing_type_id || '';
+    if (lt.includes('gold')) totalMlLideres++;
+
+    const sid = item.seller_id;
+    if (sid) {
+      sellerIds.add(sid);
+      if (!sellerMap[sid]) sellerMap[sid] = { count: 0, somaPrecos: 0, topItem: null, sid };
+      sellerMap[sid].count++;
+      sellerMap[sid].somaPrecos += preco;
+      if (!sellerMap[sid].topItem) sellerMap[sid].topItem = item;
     }
-    topMap[sid].count++;
-    topMap[sid].somaPrecos += item.price || 0;
-    if (!topMap[sid].topItem) {
-      topMap[sid].topItem = {
-        id: item.id, title: item.title, price: item.price,
+  }
+
+  // ── 9. Sellers: pegar reputação dos top 5 ──
+  const topSellerIds = Object.values(sellerMap)
+    .sort((a,b) => b.somaPrecos - a.somaPrecos)
+    .slice(0, 5)
+    .map(s => s.sid);
+
+  const sellerDetails = await parallelFetch(
+    topSellerIds.map(sid => `https://api.mercadolibre.com/users/${sid}?attributes=id,nickname,seller_reputation`),
+    5
+  );
+
+  const topSellers = topSellerIds.map((sid, i) => {
+    const s = sellerMap[sid];
+    const details = sellerDetails[i];
+    const item = s.topItem;
+    const nivel = details?.seller_reputation?.level_id || null;
+    const power = details?.seller_reputation?.power_seller_status || null;
+    const totalVendas = details?.seller_reputation?.transactions?.total || null;
+    return {
+      sellerNickname: details?.nickname || `Seller ${sid}`,
+      sellerLevel: nivel,
+      powerStatus: power,
+      totalVendasHistorico: totalVendas,
+      anunciosNaAmostra: s.count,
+      faturamentoAmostra: +s.somaPrecos.toFixed(2),
+      topItem: item ? {
+        id: item.item_id || item.id,
+        title: item.title || null,
+        price: item.price,
         freeShipping: item.shipping?.free_shipping || false,
         fulfillment: item.shipping?.logistic_type === 'fulfillment',
         originalPrice: item.original_price || null,
-        link: item.permalink, thumbnail: item.thumbnail
-      };
-    }
-  }
+        thumbnail: item.thumbnail || null,
+        link: item.permalink || null
+      } : null
+    };
+  });
 
-  const topSellers = Object.values(topMap)
-    .sort((a,b) => b.somaPrecos - a.somaPrecos)
-    .slice(0, 5)
-    .map(s => ({
-      sellerNickname: s.sellerNickname,
-      sellerLevel: s.sellerLevel,
-      powerStatus: s.powerStatus,
-      anunciosEncontrados: s.count,
-      faturamentoEstimado: +s.somaPrecos.toFixed(2),
-      topItem: s.topItem
+  // ── 10. Melhores anúncios (top 10 por preço + dados) ──
+  const melhoresAnuncios = [...uniqueItems]
+    .filter(i => i.price > 0)
+    .sort((a,b) => b.price - a.price)
+    .slice(0, 10)
+    .map(item => ({
+      id: item.item_id || item.id,
+      title: item.title || null,
+      price: item.price,
+      originalPrice: item.original_price || null,
+      freeShipping: item.shipping?.free_shipping || false,
+      fulfillment: item.shipping?.logistic_type === 'fulfillment',
+      sellerNickname: sellerMap[item.seller_id]?.topItem?.sellerNickname || null,
+      condition: item.condition,
+      thumbnail: item.thumbnail || null,
+      link: item.permalink || null,
+      isOficial: !!(item.official_store_id),
+      isPromocao: !!(item.original_price && item.original_price > item.price),
+      isInternacional: !!(item.international_delivery_mode && item.international_delivery_mode !== 'none'),
+      listingType: item.listing_type_id
     }));
 
-  const melhoresAnuncios = page1Results.slice(0, 10).map(item => ({
-    id: item.id,
-    title: item.title,
-    price: item.price,
-    originalPrice: item.original_price || null,
-    freeShipping: item.shipping?.free_shipping || false,
-    fulfillment: item.shipping?.logistic_type === 'fulfillment',
-    sellerNickname: item.seller?.nickname || null,
-    sellerLevel: item.seller?.seller_reputation?.level_id || null,
-    condition: item.condition,
-    thumbnail: item.thumbnail,
-    link: item.permalink,
-    isOficial: !!(item.official_store_id || item.official_store_name),
-    isPromocao: !!(item.original_price && item.original_price > item.price),
-    isInternacional: !!(item.international_delivery_mode && item.international_delivery_mode !== 'none')
-  }));
+  // ── 11. Métricas finais ──
+  const n = uniqueItems.length || 1;
+  const precoMedio = precos.length ? precos.reduce((a,b)=>a+b,0)/precos.length : null;
 
   return {
-    source: 'ml_scraping_v7',
+    source: 'ml_api_v7',
     query: product,
-    queryRetornada,
-    nomeCategoria,
-    paginasAnalisadas: paginasParaBuscar,
-    itemsAnalisados: allResults.length,
+    categorias: categories.slice(0, 3).map(c => c.name),
+    categoriaId: mainCat.id,
+    categoriaNome: mainCat.name,
 
-    totalAnuncios: totalBusca,
-    totalLojasOficiais: metricas20.oficiais,
-    totalFull: metricas20.full,
-    totalFreteGratis: metricas20.freteGratis,
-    totalMercadoLideres: metricas20.mercadoLideres,
-    totalInternacional: metricas20.internacional,
-    totalPromocao: metricas20.promocao,
-    totalSellers: metricas20.sellers.size,
+    // ── MÉTRICAS PRINCIPAIS ──
+    totalAnuncios: totalBuscaExata || totalNaCategoria,        // total da busca keyword exata
+    totalNaCategoria: totalNaCategoria,                         // total na categoria
+    itemsAnalisados: uniqueItems.length,                        // amostra analisada
 
-    mercadoEnderecavel: +metricas20.somaPrecos.toFixed(2),
-    precoMedioP1: precoMedioP1 ? +precoMedioP1.toFixed(2) : null,
-    precoMedio20: precoMedio20 ? +precoMedio20.toFixed(2) : null,
-    precoMin: precos20.length ? +Math.min(...precos20).toFixed(2) : null,
-    precoMax: precos20.length ? +Math.max(...precos20).toFixed(2) : null,
+    totalLojasOficiais: totalOficiais,
+    totalFull: totalFull,
+    totalFreteGratis: totalFrete,
+    totalMercadoLideres: totalMlLideres,
+    totalInternacional: totalIntl,
+    totalPromocao: totalPromo,
+    totalSellers: sellerIds.size,
 
-    pctFull: allResults.length ? +(metricas20.full / allResults.length * 100).toFixed(1) : 0,
-    pctFreteGratis: allResults.length ? +(metricas20.freteGratis / allResults.length * 100).toFixed(1) : 0,
-    pctPromocao: allResults.length ? +(metricas20.promocao / allResults.length * 100).toFixed(1) : 0,
-    pctOficiais: allResults.length ? +(metricas20.oficiais / allResults.length * 100).toFixed(1) : 0,
+    // Percentuais (baseados na amostra)
+    pctFull: +(totalFull / n * 100).toFixed(1),
+    pctFreteGratis: +(totalFrete / n * 100).toFixed(1),
+    pctPromocao: +(totalPromo / n * 100).toFixed(1),
+    pctOficiais: +(totalOficiais / n * 100).toFixed(1),
+
+    // Preços
+    precoMedio: precoMedio ? +precoMedio.toFixed(2) : null,
+    precoMedioP1: precoMedio ? +precoMedio.toFixed(2) : null,  // melhor estimativa disponível
+    precoMin: precos.length ? +Math.min(...precos).toFixed(2) : null,
+    precoMax: precos.length ? +Math.max(...precos).toFixed(2) : null,
+    mercadoEnderecavel: precos.length ? +precos.reduce((a,b)=>a+b,0).toFixed(2) : null,
 
     topSellers,
     melhoresAnuncios
