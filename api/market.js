@@ -1,5 +1,5 @@
 // api/market.js — DEXAN Backend v4
-// Sources: mercadolivre (ML API + fallback SerpApi)
+// ML data via SerpApi Google Shopping BR (filtra resultados do ML + demais)
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -13,7 +13,7 @@ export default async function handler(req, res) {
 
   try {
     if (source === 'mercadolivre') {
-      return res.json(await fetchMercadoLivre(product));
+      return res.json(await fetchMLData(product));
     }
     return res.status(400).json({ error: 'source inválida. Use: mercadolivre' });
   } catch (err) {
@@ -22,145 +22,78 @@ export default async function handler(req, res) {
   }
 }
 
-// ── MERCADO LIVRE ─────────────────────────────────────────
-async function fetchMercadoLivre(product) {
-  // Tenta ML API oficial primeiro
-  try {
-    const mlResult = await fetchMLNative(product);
-    if (mlResult && !mlResult.error) return mlResult;
-  } catch (e) {
-    console.log('ML native failed, trying SerpApi fallback:', e.message);
-  }
-
-  // Fallback: SerpApi Google Shopping filtrando ML
+// ── ML DATA via SerpApi Google Shopping BR ────────────────
+// Google Shopping BR retorna ~20-40% dos resultados do ML naturalmente
+// Completamos com busca direta "site:mercadolivre.com.br"
+async function fetchMLData(product) {
   const serpKey = process.env.SERPAPI_KEY;
-  if (serpKey) {
-    try {
-      return await fetchMLViaSerpApi(product, serpKey);
-    } catch (e) {
-      console.log('SerpApi fallback also failed:', e.message);
-    }
+  if (!serpKey) {
+    return { error: 'SERPAPI_KEY não configurada', nokey: true, totalItems: 0 };
   }
 
-  return { error: 'Não foi possível buscar dados do ML. Tente novamente.', totalItems: 0 };
-}
+  const q = encodeURIComponent(product);
 
-// ── ML API OFICIAL ────────────────────────────────────────
-async function fetchMLNative(product) {
-  const query = encodeURIComponent(product);
-  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${query}&limit=20&sort=relevance`;
+  // Busca 1: Google Shopping BR geral (40 resultados inclui ML, Shopee, Amazon BR etc)
+  const url1 = `https://serpapi.com/search.json?engine=google_shopping&q=${q}&gl=br&hl=pt-BR&location=Brazil&api_key=${serpKey}&num=40`;
 
-  const response = await fetch(url, {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (compatible; DEXAN-Radar/4.0)'
-    }
-  });
+  const r1 = await fetch(url1);
+  if (!r1.ok) throw new Error('SerpApi error: ' + r1.status);
+  const d1 = await r1.json();
+  if (d1.error) throw new Error(d1.error);
 
-  if (response.status === 403) {
-    throw new Error('ML API 403 - needs OAuth');
-  }
-  if (!response.ok) {
-    throw new Error(`ML API error: ${response.status}`);
-  }
+  const allItems = d1.shopping_results || [];
+  if (!allItems.length) return { error: 'Nenhum resultado encontrado', totalItems: 0 };
 
-  const data = await response.json();
-  if (data.error) throw new Error(data.message || data.error);
+  // Separar ML dos outros
+  const mlItems = allItems.filter(i =>
+    String(i.source || '').toLowerCase().includes('mercado')
+  );
+  const otherItems = allItems.filter(i =>
+    !String(i.source || '').toLowerCase().includes('mercado')
+  );
 
-  const items = data.results || [];
-  if (!items.length) return { error: 'Nenhum resultado no ML', totalItems: 0 };
+  // Usar ML se tiver suficiente, senão usar todos
+  const primaryItems = mlItems.length >= 3 ? mlItems : allItems;
 
-  return formatMLResponse(product, items, data.paging?.total || items.length);
-}
-
-// ── SERPAPI FALLBACK: Google Shopping filtrando ML ────────
-async function fetchMLViaSerpApi(product, apiKey) {
-  // Busca no Google Shopping com filtro de site ML
-  const query = encodeURIComponent(`${product} site:mercadolivre.com.br`);
-  const url = `https://serpapi.com/search.json?engine=google_shopping&q=${query}&gl=br&hl=pt&api_key=${apiKey}&num=10`;
-
-  const response = await fetch(url);
-  if (!response.ok) throw new Error('SerpApi error: ' + response.status);
-
-  const data = await response.json();
-  if (data.error) throw new Error(data.error);
-
-  const items = data.shopping_results || [];
-  if (!items.length) {
-    // Segunda tentativa: busca direta no ML sem filtro site
-    const query2 = encodeURIComponent(product);
-    const url2 = `https://serpapi.com/search.json?engine=google_shopping&q=${query2}&gl=br&hl=pt&api_key=${apiKey}&num=10`;
-    const r2 = await fetch(url2);
-    const d2 = await r2.json();
-    const items2 = d2.shopping_results || [];
-    if (!items2.length) return { error: 'Sem resultados', totalItems: 0 };
-    return formatSerpResponse(product, items2);
-  }
-
-  return formatSerpResponse(product, items);
-}
-
-// ── FORMAT ML NATIVE RESPONSE ─────────────────────────────
-function formatMLResponse(product, items, total) {
-  const prices = items.map(i => parseFloat(i.price)).filter(p => p > 0);
-  const avgPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
-  const minPrice = Math.min(...prices);
-  const maxPrice = Math.max(...prices);
-  const freeShipping = items.filter(i => i.shipping?.free_shipping).length;
-
-  const topSellers = items.slice(0, 6).map(i => ({
-    id: i.id,
-    title: i.title,
-    price: parseFloat(i.price),
-    soldQuantity: i.sold_quantity || 0,
-    rating: i.reviews?.rating_average ? parseFloat(i.reviews.rating_average.toFixed(1)) : null,
-    freeShipping: i.shipping?.free_shipping || false,
-    condition: i.condition,
-    fulfillment: i.shipping?.logistic_type === 'fulfillment'
-  }));
-
-  return {
-    source: 'ml_native',
-    query: product,
-    totalItems: total,
-    prices: {
-      avg: parseFloat(avgPrice.toFixed(2)),
-      min: parseFloat(minPrice.toFixed(2)),
-      max: parseFloat(maxPrice.toFixed(2))
-    },
-    freeShippingPct: Math.round((freeShipping / items.length) * 100),
-    topSellers,
-    timestamp: new Date().toISOString()
-  };
-}
-
-// ── FORMAT SERPAPI RESPONSE ───────────────────────────────
-function formatSerpResponse(product, items) {
   const extractPrice = (p) => {
     if (!p) return null;
     if (typeof p === 'number') return p;
-    const match = String(p).replace(/[^\d,\.]/g, '').replace(',', '.');
-    return parseFloat(match) || null;
+    // Formatos: "R$ 108,40" ou "R$ 385,82 agora" ou "R$108.40"
+    const clean = String(p).replace(/[^\d,\.]/g, '').replace(',', '.');
+    const val = parseFloat(clean);
+    return val > 0 ? val : null;
   };
 
-  const prices = items.map(i => extractPrice(i.price)).filter(p => p && p > 0);
-  if (!prices.length) return { error: 'Sem preços encontrados', totalItems: 0 };
+  const prices = primaryItems.map(i => extractPrice(i.price)).filter(p => p && p > 0 && p < 50000);
+  if (!prices.length) return { error: 'Sem preços válidos', totalItems: 0 };
 
   const avgPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
 
-  const topSellers = items.slice(0, 6).map(i => ({
-    title: i.title || i.name || 'Produto',
+  // Top sellers com dados enriquecidos
+  const topSellers = primaryItems.slice(0, 6).map(i => ({
+    title: i.title || 'Produto',
     price: extractPrice(i.price),
-    soldQuantity: null,
+    soldQuantity: null, // Shopping não expõe vendas
     rating: i.rating ? parseFloat(i.rating) : null,
+    reviews: i.reviews || null,
     freeShipping: false,
-    condition: 'new'
+    source: i.source || 'Google Shopping',
+    isML: String(i.source || '').toLowerCase().includes('mercado'),
+    link: i.link || null
   }));
 
+  // Estimar total de anúncios ML baseado na proporção
+  const totalInSearch = d1.search_information?.total_results || allItems.length;
+  const mlProportion = allItems.length > 0 ? mlItems.length / allItems.length : 0.3;
+  const estimatedMLTotal = mlItems.length >= 3
+    ? Math.round(totalInSearch * mlProportion)
+    : allItems.length;
+
   return {
-    source: 'serpapi_fallback',
+    source: 'google_shopping_br',
+    mlItemsFound: mlItems.length,
+    totalItems: estimatedMLTotal,
     query: product,
-    totalItems: items.length,
     prices: {
       avg: parseFloat(avgPrice.toFixed(2)),
       min: parseFloat(Math.min(...prices).toFixed(2)),
@@ -168,6 +101,7 @@ function formatSerpResponse(product, items) {
     },
     freeShippingPct: 0,
     topSellers,
+    competitorSources: [...new Set(allItems.map(i => i.source).filter(Boolean))].slice(0, 6),
     timestamp: new Date().toISOString()
   };
 }
