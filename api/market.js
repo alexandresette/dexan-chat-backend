@@ -1,28 +1,15 @@
-// api/market.js — DEXAN Backend v5
-// ML API oficial via OAuth2 client_credentials + fallback SerpApi
+// api/market.js — DEXAN Backend v6
+// ML API via proxy residencial BR (IPRoyal) + fallback SerpApi
 
-let mlTokenCache = { token: null, expiresAt: 0 };
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
-async function getMLToken() {
-  const now = Date.now();
-  if (mlTokenCache.token && now < mlTokenCache.expiresAt - 60000) {
-    return mlTokenCache.token;
-  }
-  const clientId = process.env.ML_CLIENT_ID;
-  const clientSecret = process.env.ML_CLIENT_SECRET;
-  if (!clientId || !clientSecret) throw new Error('ML_CLIENT_ID / ML_CLIENT_SECRET não configurados');
-
-  const resp = await fetch('https://api.mercadolibre.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: `grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}`
-  });
-  if (!resp.ok) throw new Error('ML OAuth error: ' + resp.status);
-  const data = await resp.json();
-  if (!data.access_token) throw new Error(data.message || 'No token');
-
-  mlTokenCache = { token: data.access_token, expiresAt: now + (data.expires_in * 1000) };
-  return data.access_token;
+function getProxyAgent() {
+  const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
+  const port = process.env.IPROYAL_PORT || '12321';
+  const user = process.env.IPROYAL_USER;
+  const pass = process.env.IPROYAL_PASS;
+  if (!user || !pass) return null;
+  return new HttpsProxyAgent(`http://${user}:${pass}@${host}:${port}`);
 }
 
 export default async function handler(req, res) {
@@ -47,25 +34,33 @@ export default async function handler(req, res) {
 }
 
 async function fetchML(product) {
-  // Tentar ML API oficial com OAuth
-  try {
-    const token = await getMLToken();
-    const q = encodeURIComponent(product);
-    const url = `https://api.mercadolibre.com/sites/MLB/search?q=${q}&limit=20&sort=relevance`;
-    const resp = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      const items = data.results || [];
-      if (items.length > 0) return formatMLNative(product, items, data.paging?.total);
+  // Tentar ML API via proxy residencial BR (IPRoyal)
+  const agent = getProxyAgent();
+  if (agent) {
+    try {
+      const q = encodeURIComponent(product);
+      const url = `https://api.mercadolibre.com/sites/MLB/search?q=${q}&limit=20&sort=relevance`;
+      const resp = await fetch(url, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+        agent
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const items = data.results || [];
+        if (items.length > 0) {
+          console.log(`ML via IPRoyal OK: ${items.length} items`);
+          return formatMLNative(product, items, data.paging?.total);
+        }
+      } else {
+        console.log('ML via proxy HTTP', resp.status);
+      }
+    } catch (e) {
+      console.log('Proxy falhou:', e.message);
     }
-    console.log('ML native returned empty, trying SerpApi...');
-  } catch (e) {
-    console.log('ML OAuth failed:', e.message, '— trying SerpApi fallback');
   }
 
   // Fallback: SerpApi Google Shopping BR
+  console.log('Usando SerpApi fallback...');
   return fetchMLViaSerpApi(product);
 }
 
@@ -75,7 +70,7 @@ function formatMLNative(product, items, total) {
   const freeCount = items.filter(i => i.shipping?.free_shipping).length;
 
   return {
-    source: 'ml_native',
+    source: 'ml_native_proxy',
     query: product,
     totalItems: total || items.length,
     prices: {
