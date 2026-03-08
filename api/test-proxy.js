@@ -1,7 +1,6 @@
-// api/test-proxy.js — endpoint temporário de diagnóstico
-import https from 'https';
+// api/test-proxy.js — diagnóstico v2 com ES module correto
 import http from 'http';
-import { URL } from 'url';
+import tls from 'tls';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -9,78 +8,75 @@ export default async function handler(req, res) {
   const user = process.env.IPROYAL_USER;
   const pass = process.env.IPROYAL_PASS;
   const host = process.env.IPROYAL_HOST || 'geo.iproyal.com';
-  const port = process.env.IPROYAL_PORT || '12321';
-
+  const port = parseInt(process.env.IPROYAL_PORT || '12321');
   const logs = [];
-  logs.push(`vars: user=${user ? user.substring(0,8)+'...' : 'FALTANDO'}, pass=${pass ? 'OK' : 'FALTANDO'}, host=${host}, port=${port}`);
 
-  if (!user || !pass) {
-    return res.json({ ok: false, logs, error: 'Credenciais não configuradas' });
-  }
+  logs.push(`user=${user ? user.substring(0,8)+'...' : 'FALTANDO'}`);
+  logs.push(`pass=${pass ? pass.substring(0,8)+'...(len='+pass.length+')' : 'FALTANDO'}`);
+  logs.push(`host=${host}, port=${port}`);
+
+  if (!user || !pass) return res.json({ ok: false, logs, error: 'Credenciais faltando' });
+
+  const auth = Buffer.from(`${user}:${pass}`).toString('base64');
 
   try {
-    const proxyUrl = `http://${user}:${encodeURIComponent(pass)}@${host}:${port}`;
-    logs.push(`Conectando ao proxy: ${host}:${port}`);
-
     const result = await new Promise((resolve, reject) => {
-      const proxy = new URL(proxyUrl);
-      const connectReq = http.request({
-        host: proxy.hostname,
-        port: parseInt(proxy.port),
+      const req2 = http.request({
+        host, port,
         method: 'CONNECT',
         path: 'api.mercadolibre.com:443',
         headers: {
-          'Proxy-Authorization': 'Basic ' + Buffer.from(`${proxy.username}:${decodeURIComponent(proxy.password)}`).toString('base64'),
-          'Host': 'api.mercadolibre.com'
+          'Proxy-Authorization': `Basic ${auth}`,
+          'Host': 'api.mercadolibre.com:443'
         },
         timeout: 12000
       });
 
-      connectReq.on('timeout', () => { connectReq.destroy(); reject(new Error('CONNECT timeout 12s')); });
+      req2.on('timeout', () => { req2.destroy(); reject(new Error('CONNECT timeout')); });
+      req2.on('error', reject);
 
-      connectReq.on('connect', (resp, socket) => {
-        logs.push(`CONNECT status: ${resp.statusCode}`);
-        if (resp.statusCode !== 200) {
+      req2.on('connect', (response, socket) => {
+        logs.push(`CONNECT status: ${response.statusCode}`);
+        if (response.statusCode !== 200) {
           socket.destroy();
-          return reject(new Error(`CONNECT failed: ${resp.statusCode}`));
+          return reject(new Error(`CONNECT falhou: ${response.statusCode}`));
         }
 
-        const tlsSocket = require('tls').connect({
+        const tlsSock = tls.connect({
           host: 'api.mercadolibre.com',
           socket,
           servername: 'api.mercadolibre.com'
-        }, () => {
-          logs.push('TLS OK, fazendo request GET...');
-          const getReq = https.request({
-            host: 'api.mercadolibre.com',
-            path: '/sites/MLB/search?q=colete+de+peso&limit=3',
-            method: 'GET',
-            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-            createConnection: () => tlsSocket
-          });
-          getReq.on('response', r => {
-            let body = '';
-            r.on('data', d => body += d);
-            r.on('end', () => resolve({ status: r.statusCode, body: body.substring(0, 500) }));
-          });
-          getReq.on('error', reject);
-          getReq.end();
         });
-        tlsSocket.on('error', reject);
+
+        tlsSock.on('secureConnect', () => {
+          logs.push('TLS OK! Fazendo GET...');
+          const getReq = `GET /sites/MLB/search?q=colete+de+peso&limit=3 HTTP/1.1\r\nHost: api.mercadolibre.com\r\nAccept: application/json\r\nConnection: close\r\n\r\n`;
+          tlsSock.write(getReq);
+
+          let data = '';
+          tlsSock.on('data', chunk => data += chunk);
+          tlsSock.on('end', () => {
+            const parts = data.split('\r\n\r\n');
+            const body = parts.slice(1).join('');
+            try {
+              const json = JSON.parse(body);
+              resolve({ status: 200, items: json.results?.length || 0, sample: json.results?.slice(0,2).map(i => i.title) });
+            } catch(e) {
+              resolve({ status: 200, rawBody: body.substring(0,200) });
+            }
+          });
+        });
+
+        tlsSock.on('error', reject);
       });
-      connectReq.on('error', reject);
-      connectReq.end();
+
+      req2.end();
     });
 
-    logs.push(`ML status: ${result.status}`);
-    if (result.status === 200) {
-      const data = JSON.parse(result.body || '{}');
-      logs.push(`✅ ML retornou ${data.results?.length || 0} itens`);
-      return res.json({ ok: true, logs, items: data.results?.slice(0,2).map(i => ({title: i.title, price: i.price})) });
-    } else {
-      return res.json({ ok: false, logs, mlStatus: result.status, body: result.body });
-    }
-  } catch (e) {
+    logs.push(`✅ ML retornou ${result.items} itens!`);
+    return res.json({ ok: true, logs, result });
+
+  } catch(e) {
     logs.push(`ERRO: ${e.message}`);
     return res.json({ ok: false, logs, error: e.message });
   }
