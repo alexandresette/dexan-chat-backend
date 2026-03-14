@@ -1,23 +1,29 @@
-// server.js — DEXAN Backend v2.3
+// server.js — DEXAN Backend v2.4
 import express from 'express';
 import cors from 'cors';
 import { handleMarket } from './routes/market.js';
 import { handleOAuthCallback, handleOAuthAuthorize, loadSavedToken } from './routes/auth-callback.js';
 import { handleChat } from './routes/chat.js';
+import { handleGetToken, handleAnalyze } from './routes/validador.js';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 // Restaurar token salvo ao iniciar
 loadSavedToken();
 
+// Rotas existentes
 app.post('/api/market', handleMarket);
 app.post('/api/chat',   handleChat);
 app.get('/api/oauth/callback',  handleOAuthCallback);
 app.get('/api/oauth/authorize', handleOAuthAuthorize);
 
-// Diagnóstico — testa token diretamente
+// DEXAN Validador — novos endpoints
+app.get('/api/ml-token',  handleGetToken);
+app.post('/api/analyze',  handleAnalyze);
+
+// Diagnóstico
 app.get('/api/debug', async (req, res) => {
   const hasToken = !!global._mlUserToken;
   const expiry = global._mlUserTokenExpiry;
@@ -37,7 +43,6 @@ app.get('/api/debug', async (req, res) => {
     }
   }
 
-  // Testar também com client_credentials
   let ccTest = null;
   try {
     const ML_CLIENT_ID = process.env.ML_CLIENT_ID;
@@ -60,6 +65,7 @@ app.get('/api/debug', async (req, res) => {
   }
 
   res.json({
+    version: 'v2.4 — DEXAN Validador',
     tokenOAuth: { hasToken, userId, minutosRestantes },
     mlSearchComOAuth: mlTest,
     mlSearchComCC: ccTest
@@ -67,4 +73,4 @@ app.get('/api/debug', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`DEXAN Backend v2.3 rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`DEXAN Backend v2.4 rodando na porta ${PORT}`));
